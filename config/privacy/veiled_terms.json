@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "note": "通用隐晦词表模板：high 命中即排除片段并在输出端拦截，suspect 仅标记。默认为空，可按需填写。",
+  "high": {},
+  "suspect": {},
+  "variants": {
+    "allow_separators": false,
+    "pinyin_initials": {}
+  }
+}
