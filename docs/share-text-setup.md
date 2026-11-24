@@ -90,3 +90,20 @@ iPhone 备份、JSONL（`--format jsonl --chat "文件路径"`）和 Standard JS
 ### 费用
 
 设置阶段只做免费离线检查。聊天阶段可能产生云端模型费用；程序的默认月上限是 **100 元**，按偏高单价估算（每百万输入 token 4 元、输出 token 16 元）。这是程序本地预算估算，不是服务商账单承诺；其他模型的实际价格可能不同，请同时查看服务商余额和用量，并在服务商侧设置费用限制。
+
+
+### 在 Mac 上管理长期记忆
+
+先退出正在运行的聊天，再在终端进入项目目录。首次运行以下命令并输入「同意」确认。它只为当前系统账户授权称呼、偏好和明确备注三个字段。已有的分享资料同意与这项授权相互独立。
+
+```bash
+COMPANION_PRIVATE_DATA_DIR="$HOME/Library/Application Support/kiki-share/private" \
+COMPANION_RUNTIME_DATA_DIR="$HOME/Library/Application Support/kiki-share/runtime" \
+PYTHONPATH=src .venv/bin/python -m companion.runtime.text_chat --memory grant
+```
+
+将最后的 `grant` 替换为 `list` 查看记忆，替换为 `delete` 按编号选择并确认删除一条，或替换为 `revoke` 确认撤回授权并删除该账户的全部长期记忆。管理命令在本机运行，无需模型 API 密钥。请使用完成分享设置的同一个系统账户。
+
+授权后正常打开聊天，输入「记住这件事：周六要带拼图」可在本机保存。还可用「记住我喜欢拼图」保存偏好，或用「记住以后叫我小雨」保存称呼。普通聊天和导入的历史不会自动写入长期记忆。下一轮输入「带拼图」可匹配上述备注。当前整条输入需要在字段名或记忆内容中匹配，所以「周末要带什么？」不会因此命中。匹配的记忆可能随提示发送给已配置的模型服务。
+
+删除或撤回后，下一轮提示会移除旧记忆及含旧值的近期缓存。记忆存储与管理入口目前支持 Mac 等 POSIX 系统。Windows 仍可使用普通文本聊天。

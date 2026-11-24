@@ -14,6 +14,7 @@ import pytest
 
 import companion.dialogue.composition as composition
 import companion.dialogue.config as dialogue_config
+import companion.memory as memory_module
 import companion.runtime.speech_dialogue as speech_dialogue
 from companion.contracts import DialogueResponse
 from companion.runtime import private_paths, share_lock, text_chat
@@ -327,8 +328,13 @@ def test_startup_failure_releases_lock(host, capsys):
     assert capsys.readouterr().out == STARTUP_FAILED + CONNECTED
 
 
-def test_build_bridge_wires_snippets_and_privacy_revision(monkeypatch):
+@pytest.mark.parametrize("platform", ["posix", "nt"])
+def test_build_bridge_wires_snippets_and_privacy_revision(monkeypatch, platform):
     settings, config, secrets = object(), object(), object()
+    memory = Mock()
+    factory = Mock(return_value=memory)
+    monkeypatch.setattr(memory_module, "build_private_memory_service", factory)
+    monkeypatch.setattr(text_chat, "os", SimpleNamespace(name=platform))
     adapter, card = object(), "合成习惯卡"
     orchestrator = SimpleNamespace(privacy_revision=object())
     snippets = Mock(return_value=(adapter, card))
@@ -346,8 +352,16 @@ def test_build_bridge_wires_snippets_and_privacy_revision(monkeypatch):
     assert before <= snippets.call_args.kwargs["clock"]() <= datetime.now(UTC)
     build.assert_called_once_with(
         settings, config, secrets, trusted_user_id="synthetic-user", snippet_style=adapter,
-        snippet_habit_card=card, privacy_revision_sources=(adapter,),
+        snippet_habit_card=card, memory_gateway=memory if platform == "posix" else None,
+        privacy_revision_sources=(memory, adapter) if platform == "posix" else (adapter,),
     )
+    if platform == "posix":
+        assert factory.call_args.args == (settings,)
+        assert factory.call_count == 1
+        assert before <= factory.call_args.kwargs["clock"]() <= datetime.now(UTC)
+    else:
+        factory.assert_not_called()
+    memory.grant_consent.assert_not_called()
     bridge.assert_called_once_with(
         orchestrator=orchestrator, privacy_revision=orchestrator.privacy_revision,
     )

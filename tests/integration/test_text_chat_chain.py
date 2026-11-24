@@ -17,11 +17,15 @@ import pytest
 
 import companion.dialogue.composition as composition
 import companion.dialogue.config as dialogue_config
+from companion.contracts import ConsentRecord
+from companion.dialogue.context import CONTEXT_END, CONTEXT_START
 from companion.dialogue.identity import AI_DISCLOSURE
 from companion.dialogue.models import ProviderResult, ProviderUsage
-from companion.dialogue.orchestrator import MEMORY_DISABLED_FALLBACK
+from companion.dialogue.orchestrator import MEMORY_DISABLED_FALLBACK, MEMORY_WRITE_FAILED_FALLBACK
+from companion.memory import CreateMemoryRequest, build_private_memory_service
 from companion.privacy.paired_snippets import PairedSnippet, write_snippets
 from companion.runtime import private_paths, text_chat
+from companion.runtime.settings import load_settings
 from companion.runtime.share_credentials import CredentialError
 from companion.runtime.share_lock import share_session_lock
 
@@ -67,6 +71,7 @@ def text_chat_project(tmp_path, monkeypatch):
             "partner_user_id": "synthetic-user",
         },
     }), encoding="utf-8")
+    (dialogue / "runtime-config.json").chmod(0o600)
     monkeypatch.setattr(text_chat.os, "environ", {
         "OPENAI_API_KEY": "synthetic-unused-key", "DEEPSEEK_API_KEY": "synthetic-unused-key",
     })
@@ -191,9 +196,22 @@ def test_main_runs_snippets_habit_card_pronouns_and_ledger(text_chat_project, mo
     second_messages = provider.complete.call_args_list[1].args[0]
     assert any("合成第一轮回答" in message.content for message in second_messages)
     # Memory's actual database is memory.sqlite3; include SQLite sidecars and .db files.
-    for root in (private_root, runtime_root):
-        for pattern in ("*.sqlite*", "*.db"):
-            assert not list(root.rglob(pattern)), (root, pattern)
+    databases = {
+        path for root in (private_root, runtime_root)
+        for pattern in ("*.sqlite*", "*.db") for path in root.rglob(pattern)
+    }
+    if os.name == "posix":
+        database = private_root / "memory/memory.sqlite3"
+        assert databases == {database}
+        assert database.stat().st_mode & 0o777 == 0o600
+        assert database.parent.stat().st_mode & 0o777 == 0o700
+        memory = build_private_memory_service(
+            load_settings(project_root), clock=lambda: datetime.now(UTC),
+        )
+        assert memory.get_consent("synthetic-user") is None
+        assert memory.list_memories("synthetic-user") == ()
+    else:
+        assert not databases
     ledgers = list((runtime_root / "dialogue").glob("*.json"))
     assert ledgers
     assert all(json.loads(path.read_text(encoding="utf-8")) for path in ledgers)
@@ -201,7 +219,7 @@ def test_main_runs_snippets_habit_card_pronouns_and_ledger(text_chat_project, mo
 
 def test_memory_command_is_refused_locally_without_billing(text_chat_project, monkeypatch, capsys):
     project_root, provider = text_chat_project
-    monkeypatch.setattr("sys.stdin", io.StringIO("记住我明天要早起\n/exit\n"))
+    monkeypatch.setattr("sys.stdin", io.StringIO("记住我喜欢拼图\n/exit\n"))
     ledger_root = project_root / "runtime_data" / "dialogue"
     before = {path.name: path.read_bytes() for path in ledger_root.glob("*.json")}
     assert before == {}
@@ -209,7 +227,8 @@ def test_memory_command_is_refused_locally_without_billing(text_chat_project, mo
     assert text_chat.main(["--project-root", str(project_root)]) == 0
 
     provider.complete.assert_not_called()
-    assert f"kiki：{AI_DISCLOSURE}\n{MEMORY_DISABLED_FALLBACK}\n" in capsys.readouterr().out
+    refusal = MEMORY_WRITE_FAILED_FALLBACK if os.name == "posix" else MEMORY_DISABLED_FALLBACK
+    assert f"kiki：{AI_DISCLOSURE}\n{refusal}\n" in capsys.readouterr().out
     after = {path.name: path.read_bytes() for path in ledger_root.glob("*.json")}
     assert after == before
 
@@ -432,3 +451,144 @@ def test_chat_process_is_rejected_while_setup_session_is_locked(chat_processes):
     assert chat.returncode == 0, error
     assert "已连接。" in output
     assert "complete" in calls.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Protected memory storage requires POSIX")
+@pytest.mark.parametrize("remove", ["delete", "revoke"])
+def test_share_builder_memory_lifecycle(text_chat_project, monkeypatch, capsys, remove):
+    root, provider = text_chat_project
+    settings = load_settings(root)
+    config, secrets = dialogue_config.load_dialogue_config(settings)
+    user = text_chat.current_user_id()
+    assert user == config.snippet_style.partner_user_id
+    bridge = text_chat._build_bridge(settings, config, secrets, user)
+    writer = build_private_memory_service(settings, clock=lambda: datetime.now(UTC))
+    canary = "SYNTHETIC_MEMORY_BLUE"
+    command = "记住这件事：合成拼图 " + canary
+    query = "合成拼图"
+    assert writer.get_consent(user) is None
+    refusal = bridge.reply(user_id=user, text=command)
+    assert refusal.blocked_reason == "memory_write_failed"
+    assert not refusal.billable
+    assert writer.list_memories(user) == ()
+    provider.complete.assert_not_called()
+    assert not list((settings.runtime_data_dir / "dialogue").glob("*.json"))
+
+    def grant(subject):
+        writer.grant_consent(ConsentRecord(
+            user_id=subject, granted=True, granted_at=datetime.now(UTC),
+            allowed_fields=["explicit_note"],
+        ))
+
+    other = "synthetic-other"
+    grant(other)
+    assert bridge.reply(user_id=user, text=command).blocked_reason == "memory_write_failed"
+    other_canary = "SYNTHETIC_MEMORY_OTHER"
+    other_entry = writer.create_memory(CreateMemoryRequest(
+        user_id=other, field="explicit_note", value=query + " " + other_canary,
+        source_timestamp=datetime.now(UTC), explicitly_requested=True,
+    ))
+    provider.complete.assert_not_called()
+
+    def manage(action, typed=""):
+        monkeypatch.setattr("sys.stdin", io.StringIO(typed))
+        assert text_chat.main(["--project-root", str(root), "--memory", action]) == 0
+        text_chat.load_api_key.assert_not_called()
+        return capsys.readouterr().out
+
+    assert "可能" in manage("grant", "同意\n")
+    assert writer.get_consent(user).granted
+    result = bridge.reply(user_id=user, text=command)
+    assert result.blocked_reason is None and not result.billable
+    (entry,) = writer.list_memories(user)
+    assert writer.list_memories(other) == (other_entry,)
+    provider.complete.assert_not_called()
+
+    def prompt():
+        return "\n".join(m.content for m in provider.complete.call_args.args[0])
+
+    def regular_reply(answer):
+        provider.complete.side_effect = None
+        provider.complete.return_value = ProviderResult(
+            text=answer, usage=ProviderUsage(prompt_tokens=8, completion_tokens=4, total_tokens=12),
+        )
+        assert bridge.reply(user_id=user, text=query).blocked_reason is None
+
+    regular_reply("合成回复提到 " + canary)
+    assert canary in prompt() and other_canary not in prompt()
+    regular_reply("合成安全回复")
+    history = prompt().split(CONTEXT_START, 1)[1].split(CONTEXT_END, 1)[0]
+    assert canary in history and other_canary not in prompt()
+    assert writer.list_memories(user) == (entry,)
+    shown = manage("list")
+    assert canary in shown and other_canary not in shown
+    manage("delete", "1\n取消\n")
+    manage("revoke", "取消\n")
+    assert writer.list_memories(user) == (entry,)
+    if remove == "delete":
+        manage("delete", "1\n删除\n")
+        assert writer.get_consent(user).granted
+    else:
+        manage("revoke", "撤回\n")
+        assert not writer.get_consent(user).granted
+    regular_reply("合成安全回复")
+    assert canary not in prompt() and other_canary not in prompt()
+    assert writer.retrieve_memories(user, query) == ()
+    assert writer.get_consent(other).granted
+    bridge.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Protected memory storage requires POSIX")
+@pytest.mark.parametrize("case", ["decline", "mismatch", "unsafe_config", "busy", "non_posix"])
+def test_memory_management_requires_confirmation_and_own_account(
+    text_chat_project, monkeypatch, capsys, case,
+):
+    root, provider = text_chat_project
+    if case == "mismatch":
+        monkeypatch.setattr(text_chat, "current_user_id", lambda: "synthetic-other")
+    if case == "non_posix":
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(text_chat, "os", SimpleNamespace(name="nt"))
+    settings = load_settings(root)
+    if case == "unsafe_config":
+        (settings.private_data_dir / "dialogue/runtime-config.json").chmod(0o644)
+    args = ["--project-root", str(root), "--memory", "grant"]
+    monkeypatch.setattr("sys.stdin", io.StringIO("不同意\n" if case == "decline" else "同意\n"))
+    if case == "busy":
+        with share_session_lock(settings.runtime_data_dir):
+            assert text_chat.main(args) == 1
+    else:
+        assert text_chat.main(args) == (0 if case == "decline" else 1)
+    text_chat.load_api_key.assert_not_called()
+    composition.OpenAICompatibleProvider.assert_not_called()
+    provider.complete.assert_not_called()
+    assert not (settings.private_data_dir / "memory").exists()
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Protected memory storage requires POSIX")
+@pytest.mark.parametrize("action", ["list", "delete", "revoke"])
+def test_other_os_account_cannot_read_or_change_existing_memory(
+    text_chat_project, monkeypatch, capsys, action,
+):
+    root, provider = text_chat_project
+    settings = load_settings(root)
+    memory = build_private_memory_service(settings, clock=lambda: datetime.now(UTC))
+    owner = "synthetic-user"
+    memory.grant_consent(ConsentRecord(
+        user_id=owner, granted=True, granted_at=datetime.now(UTC),
+        allowed_fields=["explicit_note"],
+    ))
+    entry = memory.create_memory(CreateMemoryRequest(
+        user_id=owner, field="explicit_note", value="SYNTHETIC_ACCOUNT_PRIVATE",
+        source_timestamp=datetime.now(UTC), explicitly_requested=True,
+    ))
+    monkeypatch.setattr(text_chat, "current_user_id", lambda: "synthetic-other")
+    monkeypatch.setattr("builtins.input", Mock(side_effect=AssertionError("no prompt expected")))
+    assert text_chat.main(["--project-root", str(root), "--memory", action]) == 1
+    assert entry.value not in capsys.readouterr().out
+    assert memory.get_consent(owner).granted
+    assert memory.list_memories(owner) == (entry,)
+    text_chat.load_api_key.assert_not_called()
+    provider.complete.assert_not_called()
