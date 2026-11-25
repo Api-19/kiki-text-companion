@@ -153,6 +153,7 @@ def main(
             from companion.dialogue.config import load_dialogue_config
             from companion.dialogue.models import ProviderConfig
             from companion.dialogue.usage import MonthlyUsageLedger
+            from companion.runtime.share_blind import BLIND_NOTICE, BlindBatch
             from companion.runtime.share_calibration import ShareCalibration
             from companion.runtime.share_facts import ShareFacts, confirm_fact
             from companion.runtime.speech_dialogue import SpeechDialogueBridgeError
@@ -162,6 +163,7 @@ def main(
             )
             parser.add_argument("--project-root", type=Path, default=Path.cwd())
             parser.add_argument("--memory", choices=("grant", "list", "delete", "revoke"))
+            parser.add_argument("--blind", action="store_true")
             args, unknown = parser.parse_known_args(argv)
             if unknown:
                 raise ValueError("unknown arguments")
@@ -259,6 +261,36 @@ def main(
                     session_facts,
                 )
 
+        batch = None
+        blind_active = False
+
+        def start_blind() -> None:
+            nonlocal batch, blind_active
+            if batch is not None:
+                print("本窗口已有一个盲评批次。")
+                return
+            try:
+                if input(BLIND_NOTICE).strip() == "同意":
+                    batch = BlindBatch(settings.test_results_dir)
+                    blind_active = True
+            except (EOFError, KeyboardInterrupt):
+                pass
+
+        def save_feedback() -> None:
+            while batch is not None:
+                try:
+                    path = batch.save()
+                except (OSError, ValueError):
+                    print("汇总未保存。请检查结果目录权限和可用空间。如已有同名损坏文件，请先移开。")
+                    try:
+                        if input("回车重试，输入「退出」结束：").strip():
+                            return
+                    except (EOFError, KeyboardInterrupt):
+                        return
+                else:
+                    print(f"匿名反馈已保存：{path}")
+                    return
+
         try:
             if _first_run:
                 if calibration is not None and session_facts is not None:
@@ -267,8 +299,10 @@ def main(
                     print("首次校准暂不可用，可以继续聊天。")
             print(
                 "聊天窗口已就绪。输入消息后回车发送，输入 /calibrate-web 打开本机校准，"
-                "输入 /exit 退出。"
+                "输入 /blind 开始双回复盲评，输入 /exit 退出。"
             )
+            if args.blind:
+                start_blind()
             while True:
                 try:
                     line = input("你：").strip()
@@ -279,18 +313,44 @@ def main(
                     continue
                 if line == "/exit":
                     return 0
+                if line == "/blind":
+                    start_blind()
+                    continue
+                if line == "/feedback":
+                    if batch is None:
+                        print("本窗口还没有盲评反馈。")
+                    else:
+                        blind_active = False
+                        save_feedback()
+                        print("盲评已结束，可以继续普通聊天。")
+                    continue
                 if line in {"/calibrate", "/calibrate-web"}:
                     if calibration is None or session_facts is None:
                         print("当前账户的本地风格校准不可用。")
                     else:
                         calibrate(web=line == "/calibrate-web")
                     continue
+                handled = False
                 if session_facts is not None:
                     handled, confirmed = confirm_fact(line, user_id, session_facts)
                     if handled:
                         if confirmed is None:
                             continue
                         line = confirmed
+                if blind_active and line.startswith("/"):
+                    print("未识别的本地命令。")
+                    continue
+                local_memory = handled or line.startswith("记住")
+                if blind_active and batch is not None and not local_memory:
+                    try:
+                        if not bridge.share_blind_turn(
+                            user_id=user_id, text=line, choose=batch.choose,
+                        ):
+                            return 0
+                    except SpeechDialogueBridgeError:
+                        batch.record_failure()
+                        print("这轮未能生成可比较的两条回复，未计票。可以继续下一题。")
+                    continue
                 try:
                     response = bridge.reply(user_id=user_id, text=line)
                 except SpeechDialogueBridgeError:
@@ -301,6 +361,8 @@ def main(
             bridge.close()
             if session_facts is not None:
                 session_facts.clear()
+            if batch is not None:
+                save_feedback()
 
 
 if __name__ == "__main__":

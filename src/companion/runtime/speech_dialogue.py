@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Protocol
+from typing import Protocol, cast
 
 from pydantic import BaseModel
 
@@ -26,6 +26,14 @@ class _DialogueRuntime(Protocol):
         *,
         trusted_user_id: str | None = None,
     ) -> DialogueRun: ...
+
+
+class _ShareBlindRuntime(Protocol):
+    def share_blind_pair(
+        self, request: DialogueRequest, *, trusted_user_id: str, revision: PrivacyRevision,
+    ) -> tuple[DialogueResponse, DialogueResponse]: ...
+
+    def commit_share_reply(self, user_id: str, response: DialogueResponse) -> None: ...
 
 
 class SpeechDialogueBridgeError(RuntimeError):
@@ -109,18 +117,7 @@ class SpeechDialogueBridge:
 
         validated_user_id = (" " + user_id)[1:]
         validated_text = (" " + text)[1:]
-        if self._privacy_revision is not None:
-            try:
-                revision = self._privacy_revision(validated_user_id)
-            except Exception:
-                self._recent_context.pop(validated_user_id, None)
-                self._privacy_revisions.pop(validated_user_id, None)
-                raise
-            if self._closed:
-                raise _BridgeBoundaryFailure
-            if self._privacy_revisions.get(validated_user_id) != revision:
-                self._recent_context.pop(validated_user_id, None)
-                self._privacy_revisions[validated_user_id] = revision
+        self._refresh_revision(validated_user_id)
         recent_context = list(self._recent_context.get(validated_user_id, ()))
         request = DialogueRequest(
             user_id=validated_user_id,
@@ -183,6 +180,61 @@ class SpeechDialogueBridge:
         validated_user_id = None  # type: ignore[assignment]
         validated_text = None  # type: ignore[assignment]
         return response
+
+    def _refresh_revision(self, user_id: str) -> PrivacyRevision:
+        if self._privacy_revision is not None:
+            try:
+                revision = self._privacy_revision(user_id)
+            except Exception:
+                self._recent_context.pop(user_id, None)
+                self._privacy_revisions.pop(user_id, None)
+                raise
+            if self._closed:
+                raise _BridgeBoundaryFailure
+            if self._privacy_revisions.get(user_id) != revision:
+                self._recent_context.pop(user_id, None)
+                self._privacy_revisions[user_id] = revision
+            return revision
+        return ()
+
+    def share_blind_turn(
+        self, *, user_id: str, text: str,
+        choose: Callable[[tuple[DialogueResponse, DialogueResponse]], int | None],
+    ) -> bool:
+        """Show a complete pair and commit only the selected reply to dialogue history."""
+        if self._closed or self._call_in_progress:
+            _raise_bridge_failure()
+        self._call_in_progress = True
+        try:
+            revision = self._refresh_revision(user_id)
+            request = DialogueRequest(
+                user_id=user_id, text=text,
+                recent_context=list(self._recent_context.get(user_id, ())),
+            )
+            runtime = cast(_ShareBlindRuntime, self._orchestrator)
+            pair = runtime.share_blind_pair(request, trusted_user_id=user_id, revision=revision)
+            if self._refresh_revision(user_id) != revision:
+                raise _BridgeBoundaryFailure
+            choice = choose(pair)
+            if choice is None:
+                return False
+            try:
+                current = self._refresh_revision(user_id)
+            except Exception:
+                # The displayed pair was already rated. Only discard continuation.
+                return True
+            if not self._closed and current == revision:
+                picked = pair[choice]
+                runtime.commit_share_reply(user_id, picked)
+                self._store_context(user_id, f"对方\uff1a{text}")
+                self._store_context(user_id, f"你\uff1a{picked.text}")
+            return True
+        except Exception:
+            pass
+        finally:
+            self._call_in_progress = False
+        _raise_bridge_failure()
+        return False
 
     def _store_context(self, user_id: str, utterance: str) -> None:
         if len(utterance) > MAX_CONTEXT_ITEM_CHARS:

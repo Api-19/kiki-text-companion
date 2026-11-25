@@ -511,6 +511,94 @@ class DialogueOrchestrator:
             observation_context=observation_context,
         )
 
+    def share_blind_pair(
+        self, request: DialogueRequest, *, trusted_user_id: str,
+        revision: PrivacyRevision,
+    ) -> tuple[DialogueResponse, DialogueResponse]:
+        """Generate two checked replies against one snapshot without committing either."""
+        from companion.dialogue.models import MAX_PROMPT_UTF8_BYTES
+        from companion.dialogue.share_plan import planned_prompt, planning_prompt
+
+        prepared = prepare_dialogue_input(request)
+        user_id = _validated_trusted_user_id(trusted_user_id, prepared)
+        if (
+            user_id is None or not self._style_accepts_user(user_id)
+            or self._snippet_style is None or prepared.text.startswith("记住")
+        ):
+            raise ValueError("share comparison unavailable")
+        now = self._aware_now()
+        self._ledger.ensure_available(3, now=now)
+
+        def check_revision() -> None:
+            if self.privacy_revision(user_id) != revision:
+                raise PrivacyRevisionUnavailable(PRIVACY_REVISION_FAILURE)
+
+        check_revision()
+        memories: tuple[MemoryEntry, ...] = ()
+        if self._memory is not None:
+            memories = _validated_memory_batch(
+                self._memory.retrieve_memories(user_id, prepared.text, limit=5), user_id=user_id,
+            )
+        profile = self._retrieve_profile(prepared, user_id=user_id)
+        guidance, base, examples, count, _ = self._snippet_prompt(
+            prepared, DialogueMode.STYLED, user_id=user_id, memories=memories, profile=profile,
+        )
+        check_revision()
+        planner = planning_prompt(base)
+        layer = planned_prompt(base, self._request_share_plan(planner))
+        if sum(len(m.content.encode("utf-8")) for m in layer.messages) > MAX_PROMPT_UTF8_BYTES:
+            raise ValueError("share comparison prompt too long")
+        session = self._sessions.get(user_id, DialogueSessionState())
+
+        def generate(prompt: PromptBundle) -> DialogueResponse:
+            check_revision()
+            dispatch_time = self._aware_now()
+            reservation = self._ledger.reserve(count=1, now=dispatch_time)[0]
+            with provider_deadline_scope(time.monotonic() + self._config.provider.timeout_seconds):
+                run = self._complete_once(
+                    user_id=user_id, request_text=prepared.text, session=session, guidance=guidance,
+                    prompt=prompt, reservation=reservation, mode=DialogueMode.STYLED,
+                    now=dispatch_time, persist_session=False, extra_examples=examples,
+                    style_evidence_count=count,
+                    profile_topics=tuple(item.topic for item in profile),
+                )
+            if run.response.blocked_reason is not None:
+                raise ValueError("share comparison reply unavailable")
+            return run.response
+
+        original, layered = generate(base), generate(layer)
+        check_revision()
+        return original, layered
+
+    def _request_share_plan(self, prompt: PromptBundle) -> str:
+        now = self._aware_now()
+        reservation = self._ledger.reserve(count=1, now=now)[0]
+        usage = None
+        unbilled = False
+        try:
+            with provider_deadline_scope(time.monotonic() + self._config.provider.timeout_seconds):
+                candidate = self._provider.complete(prompt.messages)
+            valid = ProviderResult.model_validate(
+                candidate.model_dump(mode="python", warnings=False),
+            )
+            usage = valid.usage
+            return valid.text
+        except ProviderError as error:
+            unbilled = provider_failure_unbilled(error)
+            raise ValueError("share comparison plan unavailable") from None
+        finally:
+            if unbilled:
+                self._ledger.cancel_unused(reservation, now=now)
+            else:
+                self._ledger.settle(reservation, usage=usage, now=now)
+
+    def commit_share_reply(self, user_id: str, response: DialogueResponse) -> None:
+        session = self._sessions.get(user_id, DialogueSessionState())
+        self._sessions[user_id] = DialogueSessionState(
+            last_completed_at=self._aware_now(),
+            identity_disclosed=session.identity_disclosed or response.disclosed_ai_identity,
+        )
+
     def reply_ab(
         self,
         scenario_id: str,

@@ -1033,3 +1033,201 @@ def test_share_calibration_web_uses_chat_session(
         capsys.readouterr()  # Explicit management is allowed to show the account's local notes.
     console = capsys.readouterr()
     assert not console.err and fact not in console.out and "合成紫伞" not in console.out
+
+
+def test_share_blind_pair_and_aggregate(text_chat_project, monkeypatch, capsys):
+    root, provider = text_chat_project
+    provider.complete.side_effect = [
+        ProviderResult(text=text, usage=ProviderUsage(
+            prompt_tokens=8, completion_tokens=4, total_tokens=12,
+        ))
+        for text in ('{"F":"last_request","S":"answer"}', "合成原稿", "合成分层稿")
+    ]
+    monkeypatch.setattr("sys.stdin", io.StringIO("同意\n合成拼图放在哪里\nA\n/exit\n"))
+    assert text_chat.main(["--project-root", str(root), "--blind"]) == 0
+    assert provider.complete.call_count == 3
+    out = capsys.readouterr().out
+    assert "回复 A" in out and "回复 B" in out
+    (feedback,) = (root / "synthetic-results").rglob("*.json")
+    result = json.loads(feedback.read_bytes())
+    assert result["comparable_rounds"] == 1
+    assert result["decisive_votes"] == 1
+    assert result["layered_wins"] + result["original_wins"] == 1
+    assert "合成" not in feedback.read_text()
+
+
+def _blind_result(text):
+    return ProviderResult(text=text, usage=ProviderUsage(
+        prompt_tokens=8, completion_tokens=4, total_tokens=12,
+    ))
+
+
+def _blind_feedback(root):
+    (feedback,) = (root / "synthetic-results").rglob("*.json")
+    return json.loads(feedback.read_text())
+
+
+def test_share_blind_common_material_selected_history_and_one_export(
+    text_chat_project, monkeypatch, capsys,
+):
+    root, provider = text_chat_project
+    from companion.runtime import share_blind
+
+    monkeypatch.setattr(share_blind.secrets, "randbelow", Mock(side_effect=[0, 1]))
+    settings = load_settings(root)
+    writer = build_private_memory_service(settings, clock=lambda: datetime.now(UTC))
+    user = text_chat.current_user_id()
+    writer.grant_consent(ConsentRecord(
+        user_id=user, granted=True, granted_at=datetime.now(UTC),
+        allowed_fields=["explicit_note"],
+    ))
+    writer.create_memory(CreateMemoryRequest(
+        user_id=user, field="explicit_note", value="合成拼图放在哪里：合成只读记忆",
+        source_timestamp=datetime.now(UTC), explicitly_requested=True,
+    ))
+    provider.complete.side_effect = [
+        _blind_result(text) for text in (
+            '{"F":"last_request","S":"answer"}', "原稿一", "分层稿一",
+            '{"S":"follow_up","F":"prior_context"}', "原稿二", "分层稿二",
+        )
+    ]
+    monkeypatch.setattr("sys.stdin", io.StringIO(
+        "/blind\n同意\n合成拼图放在哪里\nA\n合成第二次提问\nA\n/feedback\n/feedback\n/exit\n",
+    ))
+    assert text_chat.main(["--project-root", str(root)]) == 0
+    requests = [call.args[0] for call in provider.complete.call_args_list]
+    assert len(requests) == 6
+    assert len(requests[0]) == 2 and "合成只读记忆" not in requests[0][0].content
+    for i in (0, 3):
+        original = requests[i + 1]
+        layered = requests[i + 2]
+        assert requests[i][1] == original[1] == layered[1]
+        assert layered[0].content.split("\n\n", 1)[1] == original[0].content
+        assert "回应目的 F" in layered[0].content
+    assert "合成只读记忆" in requests[1][0].content
+    assert "合成习惯卡标题" in requests[1][0].content
+    assert "合成片段：" in requests[1][0].content
+    assert "分层稿一" in requests[3][0].content and "原稿一" not in requests[3][0].content
+    assert "承接与末句相关" in requests[5][0].content
+    assert "自然追问" in requests[5][0].content
+    assert "分层稿一" in requests[4][0].content and "原稿一" not in requests[4][0].content
+    shown = capsys.readouterr().out
+    assert shown.index("分层稿一") < shown.index("原稿一")
+    assert shown.index("原稿二") < shown.index("分层稿二")
+    result = _blind_feedback(root)
+    assert result["original_wins"] == result["layered_wins"] == 1
+    assert result["presentation"] == {"a_votes": 2, "b_votes": 0}
+    assert result["total_rounds"] == result["decisive_votes"] == 2
+    assert not any(word in json.dumps(result, ensure_ascii=False) for word in (
+        "原稿", "分层稿", "合成", "synthetic-user", str(root),
+    ))
+
+
+@pytest.mark.parametrize(
+    "failure,calls", [("plan", 1), ("original", 2), ("layered", 3), ("budget", 0)],
+)
+def test_share_blind_failure_no_pair_or_reservation(
+    text_chat_project, monkeypatch, capsys, failure, calls,
+):
+    from companion.dialogue.provider import ProviderTimeout
+
+    root, provider = text_chat_project
+    plan = _blind_result('{"F":"last_request","S":"answer"}')
+    provider.complete.side_effect = {
+        "plan": [_blind_result('{"F":"arbitrary_private_text","S":"answer"}')],
+        "original": [plan, ProviderTimeout()],
+        "layered": [plan, _blind_result("先看这边。"), ProviderTimeout()],
+        "budget": [],
+    }[failure]
+    if failure == "budget":
+        config_file = root / "synthetic-private/dialogue/runtime-config.json"
+        config = json.loads(config_file.read_bytes())
+        config["budget"]["worst_case_request_cny"] = "40"
+        config_file.write_text(json.dumps(config))
+    monkeypatch.setattr("sys.stdin", io.StringIO("同意\n合成提问\n/exit\n"))
+    assert text_chat.main(["--project-root", str(root), "--blind"]) == 0
+    assert provider.complete.call_count == calls
+    assert "回复 A" not in capsys.readouterr().out
+    result = _blind_feedback(root)
+    assert result["total_rounds"] == result["failed"] == 1
+    assert result["comparable_rounds"] == result["decisive_votes"] == 0
+    for ledger_path in (root / "runtime_data/dialogue").glob("*.json"):
+        assert json.loads(ledger_path.read_bytes())["reservations"] == {}
+
+
+def test_share_blind_stale_memory_aborts_before_next_dispatch(
+    text_chat_project, monkeypatch, capsys,
+):
+    root, provider = text_chat_project
+    writer = build_private_memory_service(load_settings(root), clock=lambda: datetime.now(UTC))
+    user = text_chat.current_user_id()
+    writer.grant_consent(ConsentRecord(
+        user_id=user, granted=True, granted_at=datetime.now(UTC),
+        allowed_fields=["explicit_note"],
+    ))
+    writer.create_memory(CreateMemoryRequest(
+        user_id=user, field="explicit_note", value="合成查询 合成旧记忆",
+        source_timestamp=datetime.now(UTC), explicitly_requested=True,
+    ))
+    calls = 0
+
+    def complete(messages):
+        nonlocal calls
+        calls += 1
+        if calls in (1, 2):
+            if calls == 1:
+                writer.revoke_consent(user)
+            return _blind_result('{"F":"last_request","S":"answer"}')
+        assert all("合成旧记忆" not in m.content for m in messages)
+        return _blind_result("合成安全回复")
+
+    provider.complete.side_effect = complete
+    monkeypatch.setattr("sys.stdin", io.StringIO("同意\n合成查询\n合成查询\n跳过\n/exit\n"))
+    assert text_chat.main(["--project-root", str(root), "--blind"]) == 0
+    assert calls == 4
+    result = _blind_feedback(root)
+    assert result["failed"] == result["skipped"] == result["comparable_rounds"] == 1
+    assert result["decisive_votes"] == 0
+    assert capsys.readouterr().out.count("回复 A") == 1
+
+
+def test_share_blind_neutral_votes_and_local_memory(text_chat_project, monkeypatch):
+    root, provider = text_chat_project
+    plan = _blind_result('{"F":"overall","S":"playful"}')
+    provider.complete.side_effect = [
+        plan, _blind_result("第一回应。"), _blind_result("第二回应。"),
+        plan, _blind_result("第三回应。"), _blind_result("第四回应。"),
+    ]
+    monkeypatch.setattr("sys.stdin", io.StringIO(
+        "同意\n记住这件事：合成临时事实\n2\n合成问题\n差不多\n"
+        "合成追问\n两条都不好\n/exit\n",
+    ))
+    if os.name not in {"posix", "nt"}:
+        pytest.skip("share memory requires Windows or POSIX")
+    assert text_chat.main(["--project-root", str(root), "--blind"]) == 0
+    assert provider.complete.call_count == 6
+    result = _blind_feedback(root)
+    assert result["tie"] == result["both_bad"] == 1
+    assert result["comparable_rounds"] == 2
+    assert result["decisive_votes"] == result["failed"] == 0
+
+
+def test_share_blind_feedback_retry_does_not_create_another_batch(tmp_path, monkeypatch):
+    from companion.runtime import share_blind
+
+    batch = share_blind.BlindBatch(tmp_path)
+    original = share_blind.os.link
+    with monkeypatch.context() as changes:
+        changes.setattr(share_blind.os, "link", Mock(side_effect=OSError("synthetic")))
+        with pytest.raises(OSError):
+            batch.save()
+    assert not list(batch.path.parent.iterdir())
+    assert share_blind.os.link is original
+    feedback = batch.save()
+    assert batch.save() == feedback
+    feedback.write_text("corrupt")
+    with pytest.raises(ValueError):
+        batch.save()
+    feedback.unlink()
+    assert batch.save() == feedback
+    assert json.loads(feedback.read_bytes())["batch_id"] == batch.batch_id

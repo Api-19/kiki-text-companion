@@ -21,7 +21,8 @@ from companion.runtime import private_paths, share_lock, text_chat
 from companion.runtime.share_credentials import CredentialError
 
 CONNECTED = (
-    "聊天窗口已就绪。输入消息后回车发送，输入 /calibrate-web 打开本机校准，输入 /exit 退出。\n"
+    "聊天窗口已就绪。输入消息后回车发送，输入 /calibrate-web 打开本机校准，"
+    "输入 /blind 开始双回复盲评，输入 /exit 退出。\n"
 )
 STARTUP_FAILED = "文本聊天暂时无法启动。\n"
 
