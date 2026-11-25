@@ -279,7 +279,38 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(status, body)
 
 
-def run_web_calibration(
+class CalibrationWeb:
+    """A started calibration page that can run in a background thread."""
+
+    def __init__(self, page: CalibrationPage, server: _Server, signals: dict) -> None:
+        self.page = page
+        self.server = server
+        self.signals = signals
+        self.url = f"{server.origin}/#{server.token}"
+
+    @property
+    def closed(self) -> bool:
+        return self.page.closed
+
+    def generate(self) -> tuple[int, dict]:
+        if self.page.phase != "ready":
+            return 409, {"message": "本轮无法再次出题。"}
+        return self.page.generate(signals=self.signals)
+
+    def serve(self) -> None:
+        try:
+            while not self.page.closed:
+                self.server.handle_request()
+        finally:
+            self.server.server_close()
+
+    def close(self) -> None:
+        self.page.closed = True
+        with suppress(OSError):
+            self.server.server_close()
+
+
+def start_web_calibration(
     *,
     library: Path,
     calibration: ShareCalibration,
@@ -287,8 +318,7 @@ def run_web_calibration(
     ledger: MonthlyUsageLedger,
     facts: ShareFacts,
     user_id: str,
-    auto_generate: bool = False,
-) -> None:
+) -> CalibrationWeb:
     try:
         candidates, signals = analyse_library(library)
         phase = "ready" if candidates else "empty"
@@ -300,32 +330,53 @@ def run_web_calibration(
         provider_factory=provider_factory, ledger=ledger, facts=facts,
         user_id=user_id,
     )
-    try:
-        with _Server(page) as server:
-            if auto_generate:
-                if page.phase == "ready":
-                    print("正在用已配置的模型分析匿名统计并出题。", flush=True)
-                    _, result = page.generate(signals=signals)
-                    if page.phase != "active":
-                        print(result["message"])
-                if page.phase != "active":
-                    if page.phase == "empty":
-                        print("没有找到适合校准的片段，可以继续聊天。")
-                    else:
-                        print("分析或出题暂未完成，可以继续聊天，稍后重新校准。")
-                    return
-            print("请在本机浏览器打开下面的地址。结束校准可返回聊天，也可在终端按 Ctrl+C。")
-            url = f"{server.origin}/#{server.token}"
-            print(url, flush=True)
-            if auto_generate:
-                import webbrowser
+    return CalibrationWeb(page, _Server(page), signals)
 
-                with suppress(OSError, webbrowser.Error):
-                    webbrowser.open(url)
-            while not page.closed:
-                server.handle_request()
+
+def run_web_calibration(
+    *,
+    library: Path,
+    calibration: ShareCalibration,
+    provider_factory: Callable[[], DialogueProvider],
+    ledger: MonthlyUsageLedger,
+    facts: ShareFacts,
+    user_id: str,
+    auto_generate: bool = False,
+) -> None:
+    try:
+        session = start_web_calibration(
+            library=library, calibration=calibration, provider_factory=provider_factory,
+            ledger=ledger, facts=facts, user_id=user_id,
+        )
+    except OSError:
+        print("本机校准网页暂时无法打开。")
+        return
+    page = session.page
+    try:
+        if auto_generate:
+            if page.phase == "ready":
+                print("正在用已配置的模型分析匿名统计并出题。", flush=True)
+                _, result = session.generate()
+                if page.phase != "active":
+                    print(result["message"])
+            if page.phase != "active":
+                if page.phase == "empty":
+                    print("没有找到适合校准的片段，可以继续聊天。")
+                else:
+                    print("分析或出题暂未完成，可以继续聊天，稍后重新校准。")
+                return
+        print("请在本机浏览器打开下面的地址。结束校准可返回聊天，也可在终端按 Ctrl+C。")
+        print(session.url, flush=True)
+        if auto_generate:
+            import webbrowser
+
+            with suppress(OSError, webbrowser.Error):
+                webbrowser.open(session.url)
+        session.serve()
     except KeyboardInterrupt:
         print("已结束网页校准。")
     except OSError:
         print("本机校准网页暂时无法打开。")
+    finally:
+        session.close()
     print("已返回聊天。")

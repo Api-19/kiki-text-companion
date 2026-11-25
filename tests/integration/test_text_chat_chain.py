@@ -1231,3 +1231,32 @@ def test_share_blind_feedback_retry_does_not_create_another_batch(tmp_path, monk
     feedback.unlink()
     assert batch.save() == feedback
     assert json.loads(feedback.read_bytes())["batch_id"] == batch.batch_id
+
+
+def test_web_mode_wires_reply_pair_commit_and_feedback(text_chat_project, monkeypatch):
+    root, provider = text_chat_project
+    provider.complete.side_effect = [
+        _blind_result("合成网页回复"),
+        _blind_result('{"F":"last_request","S":"answer"}'),
+        _blind_result("合成原稿"),
+        _blind_result("合成分层稿"),
+    ]
+    captured = {}
+
+    def fake_run_web_chat(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("companion.runtime.share_chat_web.run_web_chat", fake_run_web_chat)
+    assert text_chat.main(["--project-root", str(root), "--web"]) == 0
+
+    assert captured["model_name"] == "synthetic-model"
+    reply = captured["reply"]("合成网页提问")
+    assert reply.text.endswith("合成网页回复")
+
+    ticket = captured["pair_factory"]("合成网页提问")
+    assert [item.text for item in ticket.replies] == ["合成原稿", "合成分层稿"]
+    captured["commit_reply"](ticket, 1)
+
+    batch = captured["batch_factory"]()
+    assert batch.payload()["total_rounds"] == 0
+    assert captured["calibration_factory"] is not None

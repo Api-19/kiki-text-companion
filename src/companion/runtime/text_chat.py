@@ -164,6 +164,7 @@ def main(
             parser.add_argument("--project-root", type=Path, default=Path.cwd())
             parser.add_argument("--memory", choices=("grant", "list", "delete", "revoke"))
             parser.add_argument("--blind", action="store_true")
+            parser.add_argument("--web", action="store_true")
             args, unknown = parser.parse_known_args(argv)
             if unknown:
                 raise ValueError("unknown arguments")
@@ -290,6 +291,37 @@ def main(
                 else:
                     print(f"匿名反馈已保存：{path}")
                     return
+
+        if args.web:
+            from companion.runtime.share_calibration_web import start_web_calibration
+            from companion.runtime.share_chat_web import run_web_chat
+
+            def calibration_session():
+                ledger = MonthlyUsageLedger(
+                    settings.runtime_data_dir / "dialogue", config.budget,
+                )
+                return start_web_calibration(
+                    library=sources.library_source, calibration=calibration,
+                    provider_factory=build_calibration_provider, ledger=ledger,
+                    facts=session_facts, user_id=user_id,
+                )
+
+            calibration_factory = (
+                calibration_session
+                if calibration is not None and session_facts is not None else None
+            )
+            run_web_chat(
+                reply=lambda text: bridge.reply(user_id=user_id, text=text),
+                batch_factory=lambda: BlindBatch(settings.test_results_dir),
+                pair_factory=lambda text: bridge.share_blind_pair(
+                    user_id=user_id, text=text,
+                ),
+                commit_reply=bridge.share_blind_commit,
+                calibration_factory=calibration_factory,
+                character_name=config.character_name,
+                model_name=config.provider.model,
+            )
+            return 0
 
         try:
             if _first_run:
