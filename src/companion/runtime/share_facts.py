@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
-from companion.contracts import ConsentRecord, MemoryEntry
+from pydantic import BaseModel, ConfigDict, Field
+
+from companion.contracts import ConsentRecord, DialogueResponse, MemoryEntry
 from companion.dialogue.memory import parse_memory_command
 from companion.memory.errors import MemoryAuthorizationError, MemoryServiceError
 from companion.memory.models import MemoryField
@@ -140,24 +143,102 @@ def apply_fact_choice(
     return None
 
 
-def confirm_fact(text: str, user_id: str, temporary: ShareFacts) -> tuple[bool, str | None]:
-    """Return whether the command was handled, and a confirmed durable command if any."""
-    prefix = next((prefix for prefix in _PREFIXES if text.startswith(prefix)), None)
+def is_fact_command(text: str) -> bool:
+    return text.lstrip().startswith(_PREFIXES)
+
+
+def parse_fact_candidate(text: str, user_id: str) -> tuple[str, ParsedMemoryCommand]:
+    text = text.strip()
+    prefix = next((item for item in _PREFIXES if text.startswith(item)), None)
     if prefix is None:
-        return False, None
+        raise ValueError("invalid fact confirmation")
     text = "记住" + text[len(prefix):]
     if text.startswith("记住这件事:"):
         text = _NOTE_PREFIX + text[len("记住这件事:"):]
-    now = datetime.now(UTC)
-    command = parse_memory_command(text, user_id=user_id, source_timestamp=now)
+    command = parse_memory_command(text, user_id=user_id, source_timestamp=datetime.now(UTC))
+    if command is None and not text.startswith((
+        "记住以后叫我", "记住我喜欢", "记住我不喜欢", _NOTE_PREFIX,
+    )):
+        return prepare_note(text[len("记住"):].lstrip("：: "), user_id)
+    if command is None or not command.request.value.isprintable():
+        raise ValueError("invalid fact confirmation")
+    return text, command
+
+
+class FactChoice(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    id: str = Field(min_length=1, max_length=32)
+    choice: Literal["durable", "temporary", "skip", "edit"]
+    value: str | None = Field(default=None, max_length=500)
+
+
+class WebFactConfirmation:
+    """One local candidate, bound to the current account and scoped memory."""
+
+    def __init__(
+        self, facts: ShareFacts, user_id: str, reply: Callable[[str], DialogueResponse],
+    ) -> None:
+        self._facts = facts
+        self._user_id = user_id
+        self._reply = reply
+        self._pending: tuple[str, str, ParsedMemoryCommand] | None = None
+
+    def state(self) -> dict[str, str] | None:
+        if self._pending is None:
+            return None
+        identifier, _, command = self._pending
+        return {"id": identifier, "value": command.request.value}
+
+    def clear(self) -> None:
+        self._pending = None
+
+    def start(self, text: str) -> tuple[int, str]:
+        if self._pending is not None:
+            return 409, "请先确认或跳过当前事实。"
+        try:
+            canonical, command = parse_fact_candidate(text, self._user_id)
+        except ValueError:
+            return 400, "请在「记住」后输入具体事实，最多 500 字。"
+        self._pending = uuid4().hex, canonical, command
+        return 200, "请确认事实。命中的事实可能随后续请求发送给已配置的模型服务。"
+
+    def choose(self, data: FactChoice) -> tuple[int, str]:
+        if self._pending is None or data.id != self._pending[0]:
+            return 409, "事实确认已失效。"
+        _, canonical, command = self._pending
+        if data.choice == "edit":
+            try:
+                canonical, command = prepare_note(data.value or "", self._user_id)
+            except ValueError:
+                return 400, "事实格式无效。请修改或跳过。"
+            self._pending = uuid4().hex, canonical, command
+            return 200, "已更新候选，请再选择保存范围。"
+        if data.choice == "skip":
+            self.clear()
+            return 200, "已跳过。"
+        confirmed = apply_fact_choice(canonical, command, self._facts, data.choice)
+        if confirmed is None:
+            self.clear()
+            return 200, "已记在本次聊天，退出即清除。"
+        # The canonical explicit memory command takes the bridge's existing local-only path.
+        response = self._reply(confirmed)
+        if response.blocked_reason is not None or response.billable:
+            return 409, "没有保存长期记忆。请检查记忆授权，或选仅本次、跳过。"
+        self.clear()
+        return 200, "已保存长期记忆。"
+
+
+def confirm_fact(text: str, user_id: str, temporary: ShareFacts) -> tuple[bool, str | None]:
+    """Return whether the command was handled, and a confirmed durable command if any."""
+    if not is_fact_command(text):
+        return False, None
     try:
-        if command is None and not text.startswith(("记住以后叫我", "记住我喜欢", "记住我不喜欢",
-                                                     _NOTE_PREFIX)):
-            text = _NOTE_PREFIX + text[len("记住"):].lstrip("：: ")
-            command = parse_memory_command(text, user_id=user_id, source_timestamp=now)
-        if command is None or not command.request.value.isprintable():
-            print("请在「记住」后输入具体事实，最多 500 字；没有保存。")
-            return True, None
+        text, command = parse_fact_candidate(text, user_id)
+    except ValueError:
+        print("请在「记住」后输入具体事实，最多 500 字；没有保存。")
+        return True, None
+    try:
         print(f"请确认事实：{command.request.value}")
         print("记下的事实若命中后续问题，可能随提示发送给已配置的模型服务。")
         print("1 长期记（需要授权）  2 仅本次（退出即清除）  3 跳过  4 自填")

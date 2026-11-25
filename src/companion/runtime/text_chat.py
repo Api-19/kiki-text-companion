@@ -164,6 +164,7 @@ def main(
             parser.add_argument("--project-root", type=Path, default=Path.cwd())
             parser.add_argument("--memory", choices=("grant", "list", "delete", "revoke"))
             parser.add_argument("--blind", action="store_true")
+            parser.add_argument("--web", action="store_true")
             args, unknown = parser.parse_known_args(argv)
             if unknown:
                 raise ValueError("unknown arguments")
@@ -290,6 +291,60 @@ def main(
                 else:
                     print(f"匿名反馈已保存：{path}")
                     return
+
+        if args.web:
+            from companion.runtime.share_blind_web import run_web_blind
+            from companion.runtime.share_calibration_web import start_web_calibration
+            from companion.runtime.share_chat_web import run_web_chat
+            from companion.runtime.share_facts import WebFactConfirmation
+
+            def calibration_session():
+                ledger = MonthlyUsageLedger(
+                    settings.runtime_data_dir / "dialogue", config.budget,
+                )
+                return start_web_calibration(
+                    library=sources.library_source, calibration=calibration,
+                    provider_factory=build_calibration_provider, ledger=ledger,
+                    facts=session_facts, user_id=user_id,
+                )
+
+            calibration_factory = (
+                calibration_session
+                if calibration is not None and session_facts is not None else None
+            )
+
+            def reply_web(text: str):
+                return bridge.reply(user_id=user_id, text=text)
+
+            facts = (
+                WebFactConfirmation(session_facts, user_id, reply_web)
+                if session_facts is not None and sources.partner_user_id == user_id else None
+            )
+            def web_batch():
+                return BlindBatch(settings.test_results_dir)
+
+            def web_pair(text: str):
+                return bridge.share_blind_pair(user_id=user_id, text=text)
+
+            try:
+                if args.blind:
+                    run_web_blind(
+                        batch_factory=web_batch, pair_factory=web_pair,
+                        commit_reply=bridge.share_blind_commit, facts=facts, auto_open=True,
+                    )
+                else:
+                    run_web_chat(
+                        reply=reply_web, batch_factory=web_batch, pair_factory=web_pair,
+                        commit_reply=bridge.share_blind_commit, facts=facts,
+                        calibration_factory=calibration_factory,
+                        character_name=config.character_name,
+                        model_name=config.provider.model,
+                    )
+            finally:
+                bridge.close()
+                if session_facts is not None:
+                    session_facts.clear()
+            return 0
 
         try:
             if _first_run:

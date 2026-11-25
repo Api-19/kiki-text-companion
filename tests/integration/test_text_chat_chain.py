@@ -1231,3 +1231,125 @@ def test_share_blind_feedback_retry_does_not_create_another_batch(tmp_path, monk
     feedback.unlink()
     assert batch.save() == feedback
     assert json.loads(feedback.read_bytes())["batch_id"] == batch.batch_id
+
+
+def test_web_mode_wires_reply_pair_commit_and_feedback(text_chat_project, monkeypatch):
+    root, provider = text_chat_project
+    provider.complete.side_effect = [
+        _blind_result("合成网页回复"),
+        _blind_result('{"F":"last_request","S":"answer"}'),
+        _blind_result("合成原稿"),
+        _blind_result("合成分层稿"),
+    ]
+    def fake_run_web_chat(**callbacks):
+        assert callbacks["model_name"] == "synthetic-model"
+        reply = callbacks["reply"]("合成网页提问")
+        assert reply.text.endswith("合成网页回复")
+
+        ticket = callbacks["pair_factory"]("合成网页提问")
+        assert [item.text for item in ticket.replies] == ["合成原稿", "合成分层稿"]
+        callbacks["commit_reply"](ticket, 1)
+
+        batch = callbacks["batch_factory"]()
+        assert batch.payload()["total_rounds"] == 0
+        assert callbacks["calibration_factory"] is not None
+
+    monkeypatch.setattr("companion.runtime.share_chat_web.run_web_chat", fake_run_web_chat)
+    assert text_chat.main(["--project-root", str(root), "--web"]) == 0
+
+
+@pytest.mark.parametrize("standalone", [False, True])
+def test_web_fact_confirmation_uses_local_memory(text_chat_project, monkeypatch, standalone):
+    from companion.runtime import share_blind_web, share_chat_web
+
+    root, provider = text_chat_project
+    settings = load_settings(root)
+    writer = build_private_memory_service(settings, clock=lambda: datetime.now(UTC))
+    user = text_chat.current_user_id()
+    provider.complete.side_effect = [
+        _blind_result('{"F":"last_request","S":"answer"}'),
+        _blind_result("合成原稿"),
+        _blind_result("合成分层稿"),
+    ]
+
+    def run(**kwargs):
+        kwargs.pop("auto_open", None)
+        if standalone:
+            page = share_blind_web.BlindPage(**kwargs)
+        else:
+            page = share_chat_web.ChatPage(**kwargs)
+        if standalone:
+            assert page.handle("/start", {"consent": "同意"})[0] == 200
+
+        submit = "/turn" if standalone else "/chat"
+
+        def candidate(text):
+            status, state = page.handle(submit, {"text": text})
+            assert status == 200
+            return state["fact"]["id"]
+
+        def choose(identifier, choice, **extra):
+            return page.handle("/fact", {"id": identifier, "choice": choice, **extra})
+
+        first = candidate("请记住这件事：周末要带合成红伞")
+        assert writer.get_consent(user) is None and not writer.list_memories(user)
+        provider.complete.assert_not_called()
+        assert choose(first, "durable")[0] == 409
+        assert writer.get_consent(user) is None and not writer.list_memories(user)
+        assert choose(first, "skip")[0] == 200
+        first = candidate("记住这件事：周末要带合成红伞")
+        status, state = choose(first, "edit", value="周末要带合成蓝伞")
+        assert status == 200 and state["fact"]["value"] == "周末要带合成蓝伞"
+        assert choose(first, "temporary")[0] == 409
+        assert not writer.list_memories(user)
+        assert choose(state["fact"]["id"], "temporary")[0] == 200
+        assert not writer.list_memories(user)
+
+        writer.grant_consent(ConsentRecord(
+            user_id=user, granted=True, granted_at=datetime.now(UTC),
+            allowed_fields=["explicit_note"],
+        ))
+        durable = candidate("帮我记住周末要带合成拼图")
+        assert not writer.list_memories(user)
+        assert choose(durable, "durable")[0] == 200
+        assert [entry.value for entry in writer.list_memories(user)] == ["周末要带合成拼图"]
+        provider.complete.assert_not_called()
+
+        if not standalone:
+            assert page.handle("/blind/start", {"consent": "同意"})[0] == 200
+        turn_path = "/turn" if standalone else "/blind/turn"
+        vote_path = "/vote" if standalone else "/blind/vote"
+        fact_path = "/fact" if standalone else "/blind/fact"
+        status, state = page.handle(turn_path, {"text": "周末要带什么？"})
+        assert status == 200
+        blind = state if standalone else state["blind"]
+        assert "layered_wins" not in blind["summary"]
+        assert provider.complete.call_count == 3
+        for call in provider.complete.call_args_list[-2:]:
+            prompt = "\n".join(m.content for m in call.args[0])
+            assert "周末要带合成蓝伞" in prompt
+            assert "周末要带合成拼图" in prompt
+            assert "周末要带合成红伞" not in prompt
+
+        count = provider.complete.call_count
+        round_id = blind["round"]["id"]
+        status, state = page.handle(turn_path, {"text": "帮我记住待投票事实"})
+        assert status == 409 and "投票" in state["message"]
+        assert page.handle(fact_path, {"id": durable, "choice": "temporary"})[0] == 409
+        assert provider.complete.call_count == count
+        assert page.handle(vote_path, {"round_id": round_id, "vote": "A"})[0] == 200
+
+        status, state = page.handle(turn_path, {"text": "记住盲评里的合成事实"})
+        blind = state if standalone else state["blind"]
+        assert status == 200 and blind["fact"]["value"] == "盲评里的合成事实"
+        assert page.handle(fact_path, {"id": blind["fact"]["id"], "choice": "skip"})[0] == 200
+        assert provider.complete.call_count == count
+        status, state = page.handle("/finish", {})
+        assert status == 200 and state["phase"] == "closed"
+
+    module, name = (
+        (share_blind_web, "run_web_blind") if standalone else (share_chat_web, "run_web_chat")
+    )
+    monkeypatch.setattr(module, name, run)
+    flags = ["--web", "--blind"] if standalone else ["--web"]
+    assert text_chat.main(["--project-root", str(root), *flags]) == 0

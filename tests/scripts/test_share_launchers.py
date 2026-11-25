@@ -21,7 +21,7 @@ BROKEN_VENV_MESSAGE = (
 )
 
 
-@pytest.mark.parametrize("name", ["开始设置", "开始聊天"])
+@pytest.mark.parametrize("name", ["开始设置", "开始聊天", "开始网页聊天"])
 @pytest.mark.parametrize("suffix", [".command", ".bat"])
 def test_launcher_format(name, suffix):
     path = LAUNCHERS / f"{name}{suffix}"
@@ -59,6 +59,18 @@ def test_chat_directories_match_setup(platform, suffix, monkeypatch, tmp_path):
         )
         assert match is not None
         assert match.group(1) == directory.name
+
+
+@pytest.mark.parametrize("suffix", [".command", ".bat"])
+def test_web_chat_launcher_only_adds_web_flag(suffix):
+    chat = (LAUNCHERS / f"开始聊天{suffix}").read_text(encoding="utf-8")
+    web = (LAUNCHERS / f"开始网页聊天{suffix}").read_text(encoding="utf-8")
+    assert web.count("--web") == 1
+    assert web.replace(" --web", "") == chat
+    assert "pip install" not in web
+    for variable in ("COMPANION_PRIVATE_DATA_DIR", "COMPANION_RUNTIME_DATA_DIR",
+                     "COMPANION_TEST_RESULTS_DIR"):
+        assert web.count(variable) == chat.count(variable) == 1
 
 
 @pytest.mark.parametrize("suffix", [".command", ".bat"])
@@ -217,7 +229,7 @@ def test_setup_document():
     for required in (
         '不要勾选“加密本地备份”', "Windows 版本未在真实 Windows 电脑上验证",
         "人名", "地名", "/exit", "--rebuild",
-        "网络共享路径", "@kiki-companion", ".venv",
+        "网络共享路径", "@kiki-companion", ".venv", "开始网页聊天",
     ):
         assert required in text
     assert "/Users/" not in text

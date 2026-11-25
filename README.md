@@ -13,7 +13,7 @@
 1. 安装 [Python 3.12](https://www.python.org/downloads/)。
 2. 用数据线把 iPhone 备份到这台电脑（不要加密本地备份）。
 3. 打开 `scripts/share`，双击"开始设置"（Mac 用 `.command`，Windows 用 `.bat`），按提示完成同意确认、选择聊天、填写模型服务和 API key。
-4. 双击"开始聊天"。
+4. 双击"开始聊天"；想用浏览器界面，双击"开始网页聊天"（同样在 `scripts/share` 里）。
 
 详细步骤、常见问题、重新设置和删除数据的方法见 [docs/share-text-setup.md](docs/share-text-setup.md)。
 

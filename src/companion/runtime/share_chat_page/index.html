@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本地聊天</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>本地聊天</h1>
+        <p class="sub"><span id="character">对方</span><span id="model"></span></p>
+      </div>
+      <div class="actions">
+        <button id="calibrate" class="quiet" type="button">风格校准</button>
+        <button id="finish" class="quiet" type="button">结束</button>
+      </div>
+    </header>
+
+    <nav id="tabs" class="tabs" aria-label="聊天模式">
+      <button id="tab-chat" type="button" data-mode="chat">普通聊天</button>
+      <button id="tab-blind" type="button" data-mode="blind">盲评模式</button>
+    </nav>
+
+    <div id="calibration-banner" class="panel banner" hidden>
+      <p>风格校准正在另一个标签页运行。完成或关闭它之后，这里会自动恢复。</p>
+      <a id="calibration-link" target="_blank" rel="noopener">打开校准页面</a>
+    </div>
+
+    <section id="chat-panel" aria-label="普通聊天">
+      <div id="log" class="log" aria-live="polite"></div>
+      <div class="panel composer">
+        <label for="chat-text">输入消息</label>
+        <textarea id="chat-text" maxlength="2000" rows="3"
+          placeholder="输入一句话，回车发送；换行请按 Shift + 回车。"></textarea>
+        <div class="actions">
+          <button id="chat-send" type="button">发送</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="blind-panel" hidden aria-label="双回复盲评">
+      <div id="blind-consent" class="panel" hidden>
+        <h2>开始盲评</h2>
+        <p id="blind-notice"></p>
+        <div class="actions">
+          <button id="blind-start" type="button">同意并开始</button>
+        </div>
+      </div>
+
+      <div id="blind-work" hidden>
+        <div class="panel composer">
+          <label for="blind-text">这一轮你想说什么</label>
+          <textarea id="blind-text" maxlength="2000" rows="3"
+            placeholder="输入一句话，回车生成两条回复。"></textarea>
+          <div class="actions">
+            <button id="blind-send" type="button">生成两条回复</button>
+            <button id="blind-finish" class="quiet" type="button">结束并保存本轮</button>
+          </div>
+        </div>
+
+        <section id="blind-round" hidden aria-labelledby="blind-round-title">
+          <div class="round-head">
+            <h2 id="blind-round-title" tabindex="-1">比较两条回复</h2>
+            <p id="blind-progress" class="progress"></p>
+          </div>
+          <p id="blind-echo" class="echo"></p>
+          <div class="cards">
+            <article class="panel card">
+              <h3>回复 A</h3>
+              <p id="blind-reply-a" class="reply"></p>
+            </article>
+            <article class="panel card">
+              <h3>回复 B</h3>
+              <p id="blind-reply-b" class="reply"></p>
+            </article>
+          </div>
+          <div class="actions votes" aria-label="投票">
+            <button type="button" data-vote="a">选 A</button>
+            <button type="button" data-vote="b">选 B</button>
+            <button type="button" data-vote="tie" class="quiet">差不多</button>
+            <button type="button" data-vote="both_bad" class="quiet">都不好</button>
+            <button type="button" data-vote="skip" class="quiet">跳过</button>
+          </div>
+        </section>
+
+        <section id="blind-summary" class="panel" hidden aria-labelledby="blind-summary-title">
+          <h2 id="blind-summary-title">本轮盲评汇总</h2>
+          <dl id="blind-summary-list" class="summary"></dl>
+        </section>
+      </div>
+    </section>
+
+    <section id="closed" class="panel" hidden aria-labelledby="closed-title">
+      <h2 id="closed-title">聊天已结束</h2>
+      <p id="closed-message">可以关闭这个页面，回到终端。</p>
+    </section>
+
+    <p id="feedback" role="status" aria-live="polite"></p>
+    <noscript>此页面需要 JavaScript。也可以回到终端使用聊天窗口。</noscript>
+  </main>
+</body>
+</html>

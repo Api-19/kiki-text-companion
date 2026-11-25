@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>双回复盲评</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>双回复盲评</h1>
+        <p class="sub">两条回复随机标为 A / B，你看不出哪条用了新方案。</p>
+      </div>
+      <button id="finish" class="quiet" type="button">结束并保存</button>
+    </header>
+
+    <section id="consent" class="panel" aria-labelledby="consent-title">
+      <h2 id="consent-title">开始前</h2>
+      <p id="notice"></p>
+      <div class="actions">
+        <button id="start" type="button">同意并开始</button>
+        <button id="leave" class="quiet" type="button">返回终端</button>
+      </div>
+    </section>
+
+    <section id="work" hidden>
+      <div class="panel composer">
+        <label for="text">这一轮你想说什么</label>
+        <textarea id="text" maxlength="2000" rows="3"
+          placeholder="输入一句话，回车发送；换行请按 Shift + 回车。"></textarea>
+        <div class="actions">
+          <button id="send" type="button">生成两条回复</button>
+        </div>
+      </div>
+
+      <section id="round" hidden aria-labelledby="round-title">
+        <div class="round-head">
+          <h2 id="round-title" tabindex="-1">比较两条回复</h2>
+          <p id="progress" class="progress"></p>
+        </div>
+        <div class="cards">
+          <article class="panel card">
+            <h3>回复 A</h3>
+            <p id="reply-a" class="reply"></p>
+          </article>
+          <article class="panel card">
+            <h3>回复 B</h3>
+            <p id="reply-b" class="reply"></p>
+          </article>
+        </div>
+        <div class="actions votes" aria-label="投票">
+          <button type="button" data-vote="a">选 A</button>
+          <button type="button" data-vote="b">选 B</button>
+          <button type="button" data-vote="tie" class="quiet">差不多</button>
+          <button type="button" data-vote="both_bad" class="quiet">都不好</button>
+          <button type="button" data-vote="skip" class="quiet">跳过</button>
+        </div>
+      </section>
+    </section>
+
+    <section id="done" class="panel" hidden aria-labelledby="done-title">
+      <h2 id="done-title">本轮盲评已结束</h2>
+      <p id="done-message"></p>
+      <dl id="summary" class="summary"></dl>
+      <p class="hint">可以关闭这个页面，回到终端继续聊天。</p>
+    </section>
+
+    <p id="feedback" role="status" aria-live="polite"></p>
+    <noscript>此页面需要 JavaScript。也可以回到终端使用 /blind。</noscript>
+  </main>
+</body>
+</html>
