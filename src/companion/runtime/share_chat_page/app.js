@@ -8,6 +8,10 @@ const blindPanel = byId("blind-panel");
 const tabs = byId("tabs");
 const log = byId("log");
 const feedback = byId("feedback");
+const factPanel = document.createElement("section");
+factPanel.setAttribute("aria-label", "确认记忆");
+factPanel.hidden = true;
+feedback.before(factPanel);
 const chatText = byId("chat-text");
 const blindText = byId("blind-text");
 let state;
@@ -38,6 +42,7 @@ async function request(path, body = {}, keepalive = false) {
   });
   const data = await response.json();
   if (!response.ok) {
+    if (!keepalive && data.phase) render(data);
     throw new Error(data.message || "请求失败。");
   }
   return data;
@@ -50,29 +55,67 @@ function setButtonsDisabled(disabled) {
 function applyLocks() {
   const calibration = state?.calibration?.active === true;
   const ended = state?.phase === "closed";
+  const confirmingChat = Boolean(state?.fact);
+  const confirmingBlind = Boolean(state?.blind?.fact);
   const blindPhase = state?.blind?.phase;
   document.querySelectorAll("[data-mode]").forEach((button) => {
-    button.disabled = busy || calibration || ended;
+    button.disabled = busy || calibration || ended || confirmingChat || confirmingBlind;
   });
-  byId("calibrate").disabled = busy || calibration || ended || state?.mode !== "chat";
-  chatText.disabled = busy || calibration || ended;
-  byId("chat-send").disabled = busy || calibration || ended;
-  const blindLocked = busy || calibration || ended ||
+  byId("calibrate").disabled = busy || calibration || ended || confirmingChat || state?.mode !== "chat";
+  chatText.disabled = busy || calibration || ended || confirmingChat;
+  byId("chat-send").disabled = chatText.disabled;
+  const blindLocked = busy || calibration || ended || confirmingBlind ||
     blindPhase === "waiting" || blindPhase === "complete";
   blindText.disabled = blindLocked;
   byId("blind-send").disabled = blindLocked;
   byId("blind-finish").disabled = busy || calibration || ended;
 }
 
+function renderFact(fact, path) {
+  factPanel.replaceChildren();
+  factPanel.hidden = !fact;
+  if (!fact) return;
+  const question = document.createElement("p");
+  question.textContent = `请确认事实：${fact.value}`;
+  factPanel.append(question);
+
+  const edit = document.createElement("textarea");
+  edit.maxLength = 500;
+  edit.hidden = true;
+  edit.value = fact.value;
+  edit.setAttribute("aria-label", "自填事实");
+  const confirm = (choice, value) => perform(async () => {
+    render(await request(path, {id: fact.id, choice, value}));
+  });
+  for (const [choice, label] of [
+    ["durable", "长期记（需要授权）"], ["temporary", "仅本次"],
+    ["skip", "跳过"], ["edit", "自填"],
+  ]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.addEventListener("click", () => {
+      if (choice !== "edit") return confirm(choice);
+      if (!edit.hidden) return confirm(choice, edit.value);
+      edit.hidden = false;
+      button.textContent = "确认自填";
+      edit.focus();
+    });
+    factPanel.append(button);
+  }
+  factPanel.append(edit);
+}
+
 function renderSummary(target, summary) {
   target.replaceChildren();
   if (!summary) return;
   for (const [key, label] of Object.entries(summaryLabels)) {
+    if (!(key in summary)) continue;
     const item = document.createElement("div");
     const term = document.createElement("dt");
     term.textContent = label;
     const value = document.createElement("dd");
-    value.textContent = String(summary[key] ?? 0);
+    value.textContent = String(summary[key]);
     item.append(term, value);
     target.append(item);
   }
@@ -160,6 +203,8 @@ async function refreshState() {
 function render(data) {
   state = data;
   feedback.textContent = data.message || "";
+  renderFact(data.mode === "blind" ? data.blind?.fact : data.fact,
+    data.mode === "blind" ? "/blind/fact" : "/fact");
   const ended = data.phase === "closed";
   tabs.hidden = ended;
   chatPanel.hidden = ended || data.mode !== "chat";
@@ -285,6 +330,7 @@ function finishSession() {
 byId("finish").addEventListener("click", finishSession);
 
 function clearPrivateView() {
+  renderFact(null);
   chatText.value = "";
   blindText.value = "";
   log.replaceChildren();

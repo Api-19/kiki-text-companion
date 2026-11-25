@@ -5,6 +5,8 @@ import threading
 from http.client import HTTPConnection
 from pathlib import Path
 
+import pytest
+
 from companion.contracts import DialogueResponse
 from companion.runtime import share_blind, share_chat_web
 from companion.runtime.share_blind import BlindBatch
@@ -252,3 +254,63 @@ def test_chat_page_assets_are_self_contained():
         assert "http://" not in text
         assert "https://" not in text
     assert "/style.css" in html and "/app.js" in html
+
+
+def test_web_keeps_routes_hidden_until_export_and_reports_saved_path(tmp_path):
+    page, _ = _page(tmp_path)
+    page.blind_start(StartRequest(consent="同意"))
+    _, body = page.blind_turn(TurnRequest(text="合成提问"))
+    round_id = body["blind"]["round"]["id"]
+    _, body = page.blind_vote(VoteRequest(round_id=round_id, vote="A"))
+    assert "layered_wins" not in body["blind"]["summary"]
+    assert "original_wins" not in page.handle("/state", {})[1]["blind"]["summary"]
+    status, body = page.finish()
+    assert status == 200
+    path = page.blind.batch.path
+    assert str(path) in body["message"]
+    assert str(path) in page.finish()[1]["message"]
+    assert "layered_wins" in body["blind"]["summary"]
+
+
+def test_web_fact_command_without_service_is_not_sent(tmp_path):
+    sent = []
+    page, _ = _page(tmp_path, reply=lambda text: sent.append(text) or _reply("好"))
+    for prefix in ("记住", "请记住", "帮我记住"):
+        page.chat(ChatRequest(text=prefix + "这件事：合成事实"))
+    assert sent == []
+
+
+@pytest.mark.parametrize("variant", ["chat", "blind"])
+def test_finish_failure_stays_blind_and_retries_single_report(tmp_path, monkeypatch, variant):
+    if variant == "chat":
+        page, _ = _page(tmp_path)
+        start, turn = "/blind/start", "/blind/turn"
+    else:
+        from companion.runtime.share_blind_web import BlindPage
+
+        page = BlindPage(
+            batch_factory=lambda: BlindBatch(tmp_path / "results"),
+            pair_factory=lambda _: _ticket(), commit_reply=lambda *_: None,
+        )
+        start, turn = "/start", "/turn"
+    assert page.handle(start, {"consent": "同意"})[0] == 200
+    assert page.handle(turn, {"text": "合成提问"})[0] == 200
+    batch = page.blind.batch if variant == "chat" else page.batch
+    save = batch.save
+
+    def fail():
+        raise OSError("synthetic disk failure")
+
+    monkeypatch.setattr(batch, "save", fail)
+    status, body = page.handle("/finish", {})
+    assert status == 503 and "未保存" in body["message"] and not page.closed
+    assert "layered_wins" not in json.dumps(body)
+    assert "original_wins" not in json.dumps(page.handle("/state", {})[1])
+    monkeypatch.setattr(batch, "save", save)
+    status, body = page.handle("/finish", {})
+    assert status == 200 and body["phase"] == "closed"
+    assert str(batch.path) in body["message"] == page.handle("/finish", {})[1]["message"]
+    assert list(batch.path.parent.glob("*.json")) == [batch.path]
+    payload = batch.path.read_text(encoding="utf-8")
+    assert str(batch.path) not in payload and "合成提问" not in payload
+    assert json.loads(payload)["skipped"] == 1

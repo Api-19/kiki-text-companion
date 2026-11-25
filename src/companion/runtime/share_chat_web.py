@@ -22,6 +22,7 @@ from companion.runtime.share_blind_web import (
     TurnRequest,
     VoteRequest,
 )
+from companion.runtime.share_facts import FactChoice, WebFactConfirmation, is_fact_command
 from companion.runtime.share_web import LoopbackServer
 from companion.runtime.speech_dialogue import SpeechDialogueBridgeError
 
@@ -73,8 +74,10 @@ class ChatPage:
         calibration_factory: Callable[[], CalibrationSession] | None = None,
         character_name: str = "对方",
         model_name: str = "",
+        facts: WebFactConfirmation | None = None,
     ) -> None:
         self.reply = reply
+        self.facts = facts
         self.batch_factory = batch_factory
         self.pair_factory = pair_factory
         self.commit_reply = commit_reply
@@ -88,6 +91,7 @@ class ChatPage:
         self.calibration_worker: threading.Thread | None = None
         self.message = ""
         self.closed = False
+        self._finished = False
 
     def state(self) -> dict:
         self._poll_calibration()
@@ -103,6 +107,8 @@ class ChatPage:
                 "url": self.calibration.url if self.calibration is not None else None,
             },
         }
+        if self.mode == "chat" and not self.closed and self.facts is not None:
+            result["fact"] = self.facts.state()
         if self.message:
             result["message"] = self.message
         return result
@@ -112,6 +118,7 @@ class ChatPage:
             batch_factory=self.batch_factory,
             pair_factory=self.pair_factory,
             commit_reply=self.commit_reply,
+            facts=self.facts,
         )
 
     def _ensure_blind(self) -> BlindPage:
@@ -145,6 +152,8 @@ class ChatPage:
             return 200, self.state()
         if path == "/chat":
             return self.chat(ChatRequest.model_validate(data))
+        if path in {"/fact", "/blind/fact"}:
+            return self.fact_choice(FactChoice.model_validate(data), blind=path == "/blind/fact")
         if path == "/mode":
             return self.set_mode(ModeRequest.model_validate(data))
         if path == "/blind/start":
@@ -162,7 +171,10 @@ class ChatPage:
                 return self.blind_finish()
             if path == "/calibrate":
                 return self.start_calibration()
-            return self.finish()
+            status, body = self.finish()
+            if status != 200:
+                print(body["message"], flush=True)
+            return status, body
         return 404, {"message": "未知请求。"}
 
     def chat(self, data: ChatRequest) -> tuple[int, dict]:
@@ -172,6 +184,13 @@ class ChatPage:
             return 409, {"message": "请先结束盲评模式。"}
         if self._busy_with_calibration():
             return 409, {"message": "校准页面还开着，请先完成或关闭它。"}
+        if is_fact_command(data.text):
+            if self.facts is None:
+                return 409, {"message": "本机记忆确认暂不可用。"}
+            status, self.message = self.facts.start(data.text)
+            return status, self.state()
+        if self.facts is not None and self.facts.state() is not None:
+            return 409, {"message": "请先确认或跳过当前事实。"}
         self._append("you", data.text)
         try:
             response = self.reply(data.text)
@@ -182,9 +201,28 @@ class ChatPage:
         self.message = ""
         return 200, self.state()
 
+    def fact_choice(self, data: FactChoice, *, blind: bool) -> tuple[int, dict]:
+        if self.closed or self.facts is None or self._busy_with_calibration():
+            return 409, {"message": "当前无法确认事实。"}
+        if blind and self.mode == "blind" and self.blind is not None:
+            return self._blind_result(*self.blind.fact_choice(data))
+        if blind or self.mode != "chat":
+            return 409, {"message": "请在当前聊天模式确认事实。"}
+        try:
+            status, self.message = self.facts.choose(data)
+        except SpeechDialogueBridgeError:
+            status, self.message = 503, "记忆未确认保存，可重试或跳过。"
+        return status, self.state()
+
+    def _blind_result(self, status: int, body: dict) -> tuple[int, dict]:
+        self.message = body.get("message", "")
+        return status, self.state()
+
     def set_mode(self, data: ModeRequest) -> tuple[int, dict]:
         if self.closed:
             return 409, {"message": "聊天已经结束。"}
+        if self.facts is not None and self.facts.state() is not None:
+            return 409, {"message": "请先确认或跳过当前事实。"}
         if self._busy_with_calibration():
             return 409, {"message": "校准页面还开着，请先完成或关闭它。"}
         if data.mode == "blind":
@@ -201,46 +239,47 @@ class ChatPage:
     def blind_start(self, data: StartRequest) -> tuple[int, dict]:
         if self.closed:
             return 409, {"message": "聊天已经结束。"}
+        if self.facts is not None and self.facts.state() is not None:
+            return 409, {"message": "请先确认或跳过当前事实。"}
         if self._busy_with_calibration():
             return 409, {"message": "校准页面还开着，请先完成或关闭它。"}
         blind = self._ensure_blind()
         self.mode = "blind"
-        status, body = blind.start(data)
-        return status, self.state() if status != 404 else body
+        return self._blind_result(*blind.start(data))
 
     def blind_turn(self, data: TurnRequest) -> tuple[int, dict]:
         if self.closed or self.mode != "blind" or self.blind is None:
             return 409, {"message": "当前不在盲评模式。"}
         if self._busy_with_calibration():
             return 409, {"message": "校准页面还开着，请先完成或关闭它。"}
-        status, _ = self.blind.turn(data)
-        return status, self.state()
+        return self._blind_result(*self.blind.turn(data))
 
     def blind_vote(self, data: VoteRequest) -> tuple[int, dict]:
         if self.closed or self.mode != "blind" or self.blind is None:
             return 409, {"message": "当前不在盲评模式。"}
-        status, _ = self.blind.vote(data)
-        return status, self.state()
+        return self._blind_result(*self.blind.vote(data))
 
     def blind_feedback(self) -> tuple[int, dict]:
         if self.blind is None:
             return 409, {"message": "本轮盲评还没有开始。"}
-        status, _ = self.blind.feedback()
-        return status, self.state()
+        return self._blind_result(*self.blind.feedback())
 
     def blind_finish(self) -> tuple[int, dict]:
-        if self.blind is None:
+        if self.mode != "blind" or self.blind is None:
             self.mode = "chat"
             return 200, self.state()
-        status, _ = self.blind.finish()
+        status, body = self.blind.finish()
         if status == 200:
             self.mode = "chat"
-            self.message = self.blind.message or "盲评已结束。"
-        return status, self.state()
+            if self.blind.saved_path is not None:
+                print(self.blind.message, flush=True)
+        return self._blind_result(status, body)
 
     def start_calibration(self) -> tuple[int, dict]:
         if self.closed or self.mode != "chat":
             return 409, {"message": "请先回到普通聊天再校准。"}
+        if self.facts is not None and self.facts.state() is not None:
+            return 409, {"message": "请先确认或跳过当前事实。"}
         if self._busy_with_calibration():
             return 409, {"message": "校准页面已经开着。"}
         if self.calibration_factory is None:
@@ -265,17 +304,22 @@ class ChatPage:
         self.calibration_worker = None
 
     def finish(self) -> tuple[int, dict]:
-        if self.closed:
+        if self._finished:
             return 200, self.state()
         self._close_calibration()
         if self.blind is not None:
-            status, _ = self.blind.finish()
+            status, body = self.blind.finish()
             if status != 200:
-                return status, self.state()
+                return self._blind_result(status, body)
+        if self.facts is not None:
+            self.facts.clear()
         self.messages = []
         self.mode = "chat"
         self.closed = True
+        self._finished = True
         self.message = "已结束聊天，可以关闭这个页面。"
+        if self.blind is not None and self.blind.saved_path is not None:
+            self.message = self.blind.message
         return 200, self.state()
 
 
@@ -289,11 +333,12 @@ def run_web_chat(
     character_name: str = "对方",
     model_name: str = "",
     auto_open: bool = True,
+    facts: WebFactConfirmation | None = None,
 ) -> None:
     page = ChatPage(
         reply=reply, batch_factory=batch_factory, pair_factory=pair_factory,
         commit_reply=commit_reply, calibration_factory=calibration_factory,
-        character_name=character_name, model_name=model_name,
+        character_name=character_name, model_name=model_name, facts=facts,
     )
     assets = Path(__file__).with_name("share_chat_page")
     try:
@@ -313,5 +358,7 @@ def run_web_chat(
     except OSError:
         print("本机聊天网页暂时无法打开。")
     finally:
-        page.finish()
+        status, body = page.finish()
+        if status != 200 or (page.blind is not None and page.blind.saved_path is not None):
+            print(body["message"], flush=True)
     print("已返回终端。")

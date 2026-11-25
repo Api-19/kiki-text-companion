@@ -293,8 +293,10 @@ def main(
                     return
 
         if args.web:
+            from companion.runtime.share_blind_web import run_web_blind
             from companion.runtime.share_calibration_web import start_web_calibration
             from companion.runtime.share_chat_web import run_web_chat
+            from companion.runtime.share_facts import WebFactConfirmation
 
             def calibration_session():
                 ledger = MonthlyUsageLedger(
@@ -310,17 +312,38 @@ def main(
                 calibration_session
                 if calibration is not None and session_facts is not None else None
             )
-            run_web_chat(
-                reply=lambda text: bridge.reply(user_id=user_id, text=text),
-                batch_factory=lambda: BlindBatch(settings.test_results_dir),
-                pair_factory=lambda text: bridge.share_blind_pair(
-                    user_id=user_id, text=text,
-                ),
-                commit_reply=bridge.share_blind_commit,
-                calibration_factory=calibration_factory,
-                character_name=config.character_name,
-                model_name=config.provider.model,
+
+            def reply_web(text: str):
+                return bridge.reply(user_id=user_id, text=text)
+
+            facts = (
+                WebFactConfirmation(session_facts, user_id, reply_web)
+                if session_facts is not None and sources.partner_user_id == user_id else None
             )
+            def web_batch():
+                return BlindBatch(settings.test_results_dir)
+
+            def web_pair(text: str):
+                return bridge.share_blind_pair(user_id=user_id, text=text)
+
+            try:
+                if args.blind:
+                    run_web_blind(
+                        batch_factory=web_batch, pair_factory=web_pair,
+                        commit_reply=bridge.share_blind_commit, facts=facts, auto_open=True,
+                    )
+                else:
+                    run_web_chat(
+                        reply=reply_web, batch_factory=web_batch, pair_factory=web_pair,
+                        commit_reply=bridge.share_blind_commit, facts=facts,
+                        calibration_factory=calibration_factory,
+                        character_name=config.character_name,
+                        model_name=config.provider.model,
+                    )
+            finally:
+                bridge.close()
+                if session_facts is not None:
+                    session_facts.clear()
             return 0
 
         try:

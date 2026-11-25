@@ -10,6 +10,10 @@ const done = byId("done");
 const textarea = byId("text");
 const send = byId("send");
 const feedback = byId("feedback");
+const factPanel = document.createElement("section");
+factPanel.setAttribute("aria-label", "确认记忆");
+factPanel.hidden = true;
+feedback.before(factPanel);
 let state;
 let busy = false;
 let closed = !token;
@@ -37,6 +41,7 @@ async function request(path, body = {}, keepalive = false) {
   });
   const data = await response.json();
   if (!response.ok) {
+    if (!keepalive && data.phase) render(data);
     throw new Error(data.message || "盲评请求失败。");
   }
   return data;
@@ -50,9 +55,44 @@ function setButtonsDisabled(disabled) {
 }
 
 function applyComposerLock() {
-  const locked = busy || state?.phase === "waiting";
+  const locked = busy || state?.phase === "waiting" || Boolean(state?.fact);
   textarea.disabled = locked;
   send.disabled = locked;
+}
+
+function renderFact(fact, path) {
+  factPanel.replaceChildren();
+  factPanel.hidden = !fact;
+  if (!fact) return;
+  const question = document.createElement("p");
+  question.textContent = `请确认事实：${fact.value}`;
+  factPanel.append(question);
+
+  const edit = document.createElement("textarea");
+  edit.maxLength = 500;
+  edit.hidden = true;
+  edit.value = fact.value;
+  edit.setAttribute("aria-label", "自填事实");
+  const confirm = (choice, value) => perform(async () => {
+    render(await request(path, {id: fact.id, choice, value}));
+  });
+  for (const [choice, label] of [
+    ["durable", "长期记（需要授权）"], ["temporary", "仅本次"],
+    ["skip", "跳过"], ["edit", "自填"],
+  ]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.addEventListener("click", () => {
+      if (choice !== "edit") return confirm(choice);
+      if (!edit.hidden) return confirm(choice, edit.value);
+      edit.hidden = false;
+      button.textContent = "确认自填";
+      edit.focus();
+    });
+    factPanel.append(button);
+  }
+  factPanel.append(edit);
 }
 
 function renderSummary(summary) {
@@ -60,17 +100,19 @@ function renderSummary(summary) {
   list.replaceChildren();
   if (!summary) return;
   for (const [key, label] of Object.entries(summaryLabels)) {
+    if (!(key in summary)) continue;
     const item = document.createElement("div");
     const term = document.createElement("dt");
     term.textContent = label;
     const value = document.createElement("dd");
-    value.textContent = String(summary[key] ?? 0);
+    value.textContent = String(summary[key]);
     item.append(term, value);
     list.append(item);
   }
 }
 
 function clearPrivateView() {
+  renderFact(null);
   textarea.value = "";
   byId("reply-a").textContent = "";
   byId("reply-b").textContent = "";
@@ -104,6 +146,7 @@ function renderDone(data) {
 function render(data) {
   state = data;
   feedback.textContent = data.message || "";
+  renderFact(data.fact, "/fact");
   consent.hidden = data.phase !== "consent";
   work.hidden = !(data.phase === "ready" || data.phase === "waiting");
   done.hidden = !(data.phase === "complete" || data.phase === "closed");
@@ -192,7 +235,7 @@ if (token) {
 } else {
   render({
     phase: "closed",
-    message: "此入口已失效，请回到终端重新输入 /blind-web。",
+    message: "此入口已失效，请回到终端重新打开盲评网页。",
     summary: null,
   });
 }

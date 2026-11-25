@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from companion.contracts import DialogueResponse
 from companion.dialogue.context import MAX_CURRENT_CHARS
 from companion.runtime.share_blind import BLIND_NOTICE, BlindBatch, normalize_vote
+from companion.runtime.share_facts import FactChoice, WebFactConfirmation, is_fact_command
 from companion.runtime.share_web import LoopbackServer
 from companion.runtime.speech_dialogue import SpeechDialogueBridgeError
 
@@ -34,8 +35,7 @@ _VOTE_MESSAGES = {
     "skip": "已跳过，沿用 A。",
 }
 _SUMMARY_KEYS = (
-    "total_rounds", "comparable_rounds", "decisive_votes", "layered_wins",
-    "original_wins", "tie", "both_bad", "skipped", "failed",
+    "total_rounds", "comparable_rounds", "decisive_votes", "tie", "both_bad", "skipped", "failed",
 )
 
 
@@ -83,6 +83,7 @@ class BlindPage:
         pair_factory: Callable[[str], BlindTicketLike],
         commit_reply: Callable[[BlindTicketLike, int], None],
         notice: str = BLIND_NOTICE,
+        facts: WebFactConfirmation | None = None,
     ) -> None:
         self.batch_factory = batch_factory
         self.pair_factory = pair_factory
@@ -93,6 +94,8 @@ class BlindPage:
         self.pending: _PendingRound | None = None
         self.message = ""
         self.closed = False
+        self.facts = facts
+        self.saved_path: Path | None = None
 
     def state(self) -> dict:
         state: dict = {"phase": self.phase, "summary": self._summary()}
@@ -100,6 +103,8 @@ class BlindPage:
             state["notice"] = self.notice
         if self.pending is not None:
             state["round"] = self._round_view()
+        if self.phase == "ready" and self.facts is not None:
+            state["fact"] = self.facts.state()
         if self.message:
             state["message"] = self.message
         return state
@@ -108,7 +113,10 @@ class BlindPage:
         if self.batch is None:
             return None
         payload = self.batch.payload()
-        return {key: payload[key] for key in _SUMMARY_KEYS}
+        keys = _SUMMARY_KEYS
+        if self.saved_path is not None:
+            keys += ("layered_wins", "original_wins")
+        return {key: payload[key] for key in keys}
 
     def _round_view(self) -> dict | None:
         if self.pending is None or self.batch is None:
@@ -135,12 +143,19 @@ class BlindPage:
             return self.start(StartRequest.model_validate(data))
         if path == "/turn":
             return self.turn(TurnRequest.model_validate(data))
+        if path == "/fact":
+            return self.fact_choice(FactChoice.model_validate(data))
         if path == "/vote":
             return self.vote(VoteRequest.model_validate(data))
         if path in {"/feedback", "/finish"}:
             if data != {}:
                 return 400, {"message": "请求无效。"}
-            return self.feedback() if path == "/feedback" else self.finish()
+            if path == "/feedback":
+                return self.feedback()
+            status, body = self.finish()
+            if status != 200:
+                print(body["message"], flush=True)
+            return status, body
         return 404, {"message": "未知请求。"}
 
     def start(self, data: StartRequest) -> tuple[int, dict]:
@@ -159,6 +174,13 @@ class BlindPage:
     def turn(self, data: TurnRequest) -> tuple[int, dict]:
         if self.phase != "ready" or self.batch is None:
             return 409, {"message": "当前不能生成新一轮，请先完成本轮投票。"}
+        if is_fact_command(data.text):
+            if self.facts is None:
+                return 409, {"message": "本机记忆确认暂不可用。"}
+            status, self.message = self.facts.start(data.text)
+            return status, self.state()
+        if self.facts is not None and self.facts.state() is not None:
+            return 409, {"message": "请先确认或跳过当前事实。"}
         try:
             ticket = self.pair_factory(data.text)
             presented = self.batch.present(ticket.replies)
@@ -172,6 +194,15 @@ class BlindPage:
         self.phase = "waiting"
         self.message = "请比较两条回复并选择。"
         return 200, self.state()
+
+    def fact_choice(self, data: FactChoice) -> tuple[int, dict]:
+        if self.phase != "ready" or self.facts is None:
+            return 409, {"message": "请先处理当前盲评投票。"}
+        try:
+            status, self.message = self.facts.choose(data)
+        except SpeechDialogueBridgeError:
+            status, self.message = 503, "记忆未确认保存，可重试或跳过。"
+        return status, self.state()
 
     def vote(self, data: VoteRequest) -> tuple[int, dict]:
         if self.phase != "waiting" or self.pending is None or self.batch is None:
@@ -201,33 +232,39 @@ class BlindPage:
             return 409, {"message": "本轮盲评还没有开始。"}
         if self.pending is not None:
             return 409, {"message": "请先完成本轮投票，再保存汇总。"}
+        if self.facts is not None and self.facts.state() is not None:
+            return 409, {"message": "请先确认或跳过当前事实。"}
         try:
             path = self.batch.save()
         except (OSError, ValueError):
             return 503, {"message": "汇总未保存。请检查结果目录权限和可用空间。"}
+        self.saved_path = path
         self.phase = "complete"
         self.message = f"匿名汇总已保存：{path}"
         return 200, {**self.state(), "file": str(path)}
 
     def finish(self) -> tuple[int, dict]:
-        if self.closed:
-            return 200, {"phase": "closed", "message": "盲评已经结束。"}
+        if self.phase == "closed":
+            return 200, self.state()
         if self.batch is not None:
             if self.pending is not None:
                 with suppress(ValueError):
                     self.batch.vote(self.pending.round_id, "skip")
                 self.pending = None
+                self.phase = "ready"
             try:
-                path = self.batch.save()
+                self.saved_path = self.batch.save()
             except (OSError, ValueError):
-                return 503, {"message": "汇总未保存。请检查结果目录权限和可用空间。"}
-            self.phase = "complete"
-            self.message = f"匿名汇总已保存：{path}"
+                self.message = "汇总未保存。请检查结果目录权限和可用空间，再试一次。"
+                return 503, self.state()
+        if self.facts is not None:
+            self.facts.clear()
         self.phase = "closed"
         self.closed = True
-        result = self.state()
-        result["message"] = self.message or "已结束盲评。"
-        return 200, result
+        self.message = (
+            f"匿名汇总已保存：{self.saved_path}" if self.saved_path else "已结束盲评。"
+        )
+        return 200, self.state()
 
 
 def run_web_blind(
@@ -236,9 +273,11 @@ def run_web_blind(
     pair_factory: Callable[[str], BlindTicketLike],
     commit_reply: Callable[[BlindTicketLike, int], None],
     auto_open: bool = False,
+    facts: WebFactConfirmation | None = None,
 ) -> None:
     page = BlindPage(
         batch_factory=batch_factory, pair_factory=pair_factory, commit_reply=commit_reply,
+        facts=facts,
     )
     assets = Path(__file__).with_name("share_blind_page")
     try:
