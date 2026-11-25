@@ -77,8 +77,8 @@ def _term_group(payload: object) -> dict[str, list[str]]:
 
 def _direction_mapping(records: list[SourceChatRecord]) -> ConfirmedSpeakerMapping:
     roles: dict[str, SpeakerRole] = {}
-    for direction, role in ((MessageDirection.OUTBOUND, SpeakerRole.OWNER),
-                            (MessageDirection.INBOUND, SpeakerRole.OTHER)):
+    for direction in (MessageDirection.OUTBOUND, MessageDirection.INBOUND):
+        role = SpeakerRole.OWNER if direction == MessageDirection.OUTBOUND else SpeakerRole.OTHER
         speakers = {record.source_speaker_id for record in records if record.direction is direction}
         if len(speakers) > 1:
             raise ValueError("direction has multiple speakers")
@@ -104,9 +104,20 @@ def _build(args: argparse.Namespace, *, private_root: Path) -> dict[str, str | i
     batch = StandardJsonAdapter().parse(args.chat)
     if any(issue.severity is ImportSeverity.ERROR for issue in batch.issues):
         raise ValueError("import error")
-    mapping = (_direction_mapping(batch.records) if args.direction_mapping
+    source_records = batch.records
+    if args.direction_mapping and args.target_direction == "inbound":
+        # Apply the common role validation from the chosen participant's perspective.
+        opposite = {
+            MessageDirection.INBOUND: MessageDirection.OUTBOUND,
+            MessageDirection.OUTBOUND: MessageDirection.INBOUND,
+        }
+        source_records = [
+            record.model_copy(update={"direction": opposite[record.direction]})
+            for record in source_records
+        ]
+    mapping = (_direction_mapping(source_records) if args.direction_mapping
                else ConfirmedSpeakerMapping(roles=_read_object(args.mapping)))
-    records = apply_confirmed_mapping(batch.records, mapping)
+    records = apply_confirmed_mapping(source_records, mapping)
     terms = _read_object(args.terms)
     if terms.keys() - {"redaction_terms", "risk_terms"}:
         raise ValueError("unknown term group")
@@ -192,6 +203,9 @@ def main(argv: list[str] | None = None) -> int:
         mapping = parser.add_mutually_exclusive_group(required=True)
         mapping.add_argument("--mapping", type=Path)
         mapping.add_argument("--direction-mapping", action="store_true")
+        parser.add_argument(
+            "--target-direction", choices=("outbound", "inbound"), default="outbound",
+        )
         parser.add_argument("--entities", type=Path)
         parser.add_argument("--veiled", type=Path)
         parser.add_argument("--context-turns", type=int, default=0)

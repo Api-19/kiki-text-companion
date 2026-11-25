@@ -1,0 +1,77 @@
+:root {
+  color: #202d29;
+  background: #f1f4f0;
+  font: 16px/1.65 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; }
+main { max-width: 1080px; margin: 0 auto; padding: 52px 28px; }
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+h1 { font-size: clamp(1.6rem, 4vw, 2.4rem); line-height: 1.25; margin: 0; }
+h2 { font-size: 1.2rem; line-height: 1.5; margin: 0 0 14px; overflow-wrap: anywhere; }
+p { margin: 0 0 18px; }
+button, textarea, input { font: inherit; }
+button {
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 8px 14px;
+  min-height: 44px;
+  background: #175d4b;
+  color: #fff;
+  cursor: pointer;
+}
+button:hover { background: #104a3b; }
+button.quiet { color: #245044; background: #fff; border-color: #c2d0c9; }
+button.quiet:hover { background: #e7efea; }
+button:disabled { cursor: wait; opacity: .65; }
+:focus-visible { outline: 3px solid #247960; outline-offset: 3px; }
+.panel { border: 1px solid #d6e0d9; border-radius: 14px; background: #fff; padding: 24px; }
+#work { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr); gap: 16px; }
+.context { align-self: start; background: #e8efea; }
+dl { margin: 0; }
+dt, .progress { color: #3d6356; font-size: .88rem; font-weight: 650; }
+dd { margin: 2px 0 14px; overflow-wrap: anywhere; white-space: pre-wrap; }
+dd:last-child { margin-bottom: 0; }
+.progress { margin: 0 0 8px; }
+fieldset { border: 0; padding: 0; margin: 0 0 14px; min-width: 0; }
+legend, label[for] { display: block; font-weight: 650; margin-bottom: 6px; }
+.choice {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  border: 1px solid #d6e0d9;
+  padding: 9px 12px;
+  margin-bottom: 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.choice:has(input:checked) { background: #e8f2eb; border-color: #45816c; }
+input[type="radio"] { accent-color: #175d4b; flex: none; }
+textarea {
+  color: inherit;
+  background: #fff;
+  border: 1px solid #a7bcb0;
+  border-radius: 8px;
+  padding: 9px 12px;
+  margin-bottom: 14px;
+  width: 100%;
+  min-height: 76px;
+  resize: vertical;
+}
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+#feedback { margin: 14px 0 0; font-weight: 600; }
+@media (max-width: 640px) {
+  main { padding: 22px 14px; }
+  header { flex-wrap: wrap; }
+  .panel { padding: 17px; }
+  #work { grid-template-columns: 1fr; }
+}

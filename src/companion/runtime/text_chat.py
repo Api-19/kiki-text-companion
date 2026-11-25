@@ -15,29 +15,39 @@ from typing import TYPE_CHECKING
 from companion.runtime.local_identity import current_user_id
 from companion.runtime.private_paths import check_private_directory, reject_link_ancestors
 from companion.runtime.settings import Settings, load_settings
-from companion.runtime.share_credentials import load_api_key, normalize_base_url
+from companion.runtime.share_credentials import credential_slot, load_api_key, normalize_base_url
 from companion.runtime.share_lock import ShareSessionBusy, share_session_lock
 
 if TYPE_CHECKING:
     from companion.dialogue.config import DialogueConfig, DialogueSecrets
+    from companion.runtime.share_calibration import ShareCalibration
+    from companion.runtime.share_facts import ShareFacts
     from companion.runtime.speech_dialogue import SpeechDialogueBridge
 
 
 def _build_bridge(
     settings: Settings, config: DialogueConfig, secrets: DialogueSecrets, user_id: str,
+    *, session_facts: ShareFacts | None = None, calibration: ShareCalibration | None = None,
 ) -> SpeechDialogueBridge:
     from companion.dialogue.composition import build_real_orchestrator, build_snippet_style_runtime
     from companion.runtime.speech_dialogue import SpeechDialogueBridge
 
     adapter, habit_card = build_snippet_style_runtime(config, clock=lambda: datetime.now(UTC))
     memory = None
-    if os.name == "posix":
+    if os.name in {"posix", "nt"}:
         from companion.memory import build_private_memory_service
 
         memory = build_private_memory_service(settings, clock=lambda: datetime.now(UTC))
+    gateway = memory
+    if memory is not None and session_facts is not None:
+        from companion.runtime.share_facts import ShareMemory
+
+        session_facts.bind_memory(memory)
+        gateway = ShareMemory(memory, session_facts)
     orchestrator = build_real_orchestrator(
         settings, config, secrets, trusted_user_id=user_id, snippet_style=adapter,
-        snippet_habit_card=habit_card, memory_gateway=memory,
+        snippet_habit_card=habit_card, memory_gateway=gateway,
+        snippet_calibration=calibration.guidance if calibration is not None else None,
         privacy_revision_sources=(memory, adapter) if memory is not None else (adapter,),
     )
     return SpeechDialogueBridge(
@@ -45,23 +55,36 @@ def _build_bridge(
     )
 
 
-def _manage_memory(settings: Settings, config_path: Path, user_id: str, action: str) -> int:
-    from companion.contracts import ConsentRecord
-    from companion.memory import MemoryField, build_private_memory_service
+def _read_account_config(settings: Settings, config_path: Path, user_id: str) -> dict:
+    if os.name == "nt":
+        from companion.memory.windows_storage import WindowsPrivateFiles
 
-    with open(
-        config_path, encoding="utf-8",
-        opener=lambda path, flags: os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK),
-    ) as config_file:
-        info = os.fstat(config_file.fileno())
-        if (
-            not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
-            or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
-        ):
-            raise ValueError("unsafe sharing configuration")
-        target = json.load(config_file)["snippet_style"]["partner_user_id"]
+        files = WindowsPrivateFiles()
+        files.check(settings.private_data_dir, directory=True)
+        files.check(config_path.parent, directory=True)
+        with files.read_config(config_path) as config_file:
+            payload = json.load(config_file)
+    else:
+        with open(
+            config_path, encoding="utf-8",
+            opener=lambda path, flags: os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK),
+        ) as config_file:
+            info = os.fstat(config_file.fileno())
+            if (
+                not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                raise ValueError("unsafe sharing configuration")
+            payload = json.load(config_file)
+    target = payload["snippet_style"]["partner_user_id"]
     if type(target) is not str or target != user_id:
         raise ValueError("sharing account mismatch")
+    return payload
+
+
+def _manage_memory(settings: Settings, user_id: str, action: str) -> int:
+    from companion.contracts import ConsentRecord
+    from companion.memory import MemoryField, build_private_memory_service
 
     def confirm(prompt: str, word: str) -> bool:
         try:
@@ -120,12 +143,18 @@ def _manage_memory(settings: Settings, config_path: Path, user_id: str, action: 
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None, *, _lock_held: bool = False, _first_run: bool = False,
+) -> int:
     args = None
     with ExitStack() as stack:
         try:
+            from companion.dialogue import composition
             from companion.dialogue.config import load_dialogue_config
             from companion.dialogue.models import ProviderConfig
+            from companion.dialogue.usage import MonthlyUsageLedger
+            from companion.runtime.share_calibration import ShareCalibration
+            from companion.runtime.share_facts import ShareFacts, confirm_fact
             from companion.runtime.speech_dialogue import SpeechDialogueBridgeError
 
             parser = argparse.ArgumentParser(
@@ -136,23 +165,29 @@ def main(argv: list[str] | None = None) -> int:
             args, unknown = parser.parse_known_args(argv)
             if unknown:
                 raise ValueError("unknown arguments")
-            if args.memory and os.name != "posix":
+            if args.memory and os.name not in {"posix", "nt"}:
                 print("此系统暂不支持本地长期记忆管理。")
                 return 1
             settings = load_settings(args.project_root)
-            stack.enter_context(share_session_lock(settings.runtime_data_dir))
+            if not _lock_held:
+                stack.enter_context(share_session_lock(settings.runtime_data_dir))
             user_id = current_user_id()
             config_path = settings.private_data_dir / "dialogue/runtime-config.json"
             reject_link_ancestors(config_path)
             check_private_directory(settings.private_data_dir)
             check_private_directory(config_path.parent)
+            if args.memory or os.name == "nt":
+                payload = _read_account_config(settings, config_path, user_id)
+            else:
+                payload = json.loads(config_path.read_text(encoding="utf-8"))
             if args.memory:
-                return _manage_memory(settings, config_path, user_id, args.memory)
-            payload = json.loads(config_path.read_text(encoding="utf-8"))
+                return _manage_memory(settings, user_id, args.memory)
             provider = ProviderConfig.model_validate(payload["provider"])
             base_url = normalize_base_url(str(provider.base_url))
             api_key_env = provider.api_key_env
-            key = load_api_key(api_key_env, base_url)
+            source_path = payload["snippet_style"].get("library_source", "")
+            slot = credential_slot(api_key_env, source_path)
+            key = load_api_key(slot, base_url)
             environ = {**os.environ, api_key_env: key}
             config, secrets = load_dialogue_config(settings, environ=environ)
             if (
@@ -163,6 +198,10 @@ def main(argv: list[str] | None = None) -> int:
             if config.snippet_style is None:
                 raise ValueError("snippet style configuration unavailable")
             sources = config.snippet_style
+            if credential_slot(api_key_env, sources.library_source.as_posix()) != slot:
+                raise ValueError("credential slot changed while loading configuration")
+            if os.name == "nt" and sources.partner_user_id != user_id:
+                raise ValueError("sharing account mismatch")
             source_directories = {
                 parent
                 for source in (
@@ -174,7 +213,22 @@ def main(argv: list[str] | None = None) -> int:
             } - {settings.private_data_dir, config_path.parent}
             for directory in sorted(source_directories, key=lambda path: len(path.parts)):
                 check_private_directory(directory)
-            bridge = _build_bridge(settings, config, secrets, user_id)
+            session_facts = (
+                ShareFacts(user_id, target_scope=sources.style_version)
+                if os.name in {"posix", "nt"} else None
+            )
+            calibration = None
+            if session_facts is not None and sources.partner_user_id == user_id:
+                try:
+                    calibration = ShareCalibration(
+                        settings.private_data_dir, user_id, style_version=sources.style_version,
+                    )
+                except (OSError, ValueError):
+                    print("本地风格校准资料不可用。")
+            bridge = _build_bridge(
+                settings, config, secrets, user_id, session_facts=session_facts,
+                calibration=calibration,
+            )
         except ShareSessionBusy:
             print("已经有一个聊天窗口在运行，请先关闭它。")
             return 1
@@ -182,8 +236,39 @@ def main(argv: list[str] | None = None) -> int:
             print("本地记忆管理暂不可用。" if args and args.memory else "文本聊天暂时无法启动。")
             return 1
 
+        def build_calibration_provider():
+            return composition.OpenAICompatibleProvider(
+                config=config.provider, api_key=secrets.api_key,
+                max_output_tokens=min(config.budget.max_output_tokens, 640),
+            )
+
+        def calibrate(*, web: bool, auto_generate: bool = False) -> None:
+            ledger = MonthlyUsageLedger(settings.runtime_data_dir / "dialogue", config.budget)
+            if web:
+                from companion.runtime.share_calibration_web import run_web_calibration
+
+                run_web_calibration(
+                    library=sources.library_source, calibration=calibration,
+                    provider_factory=build_calibration_provider, ledger=ledger,
+                    facts=session_facts, user_id=user_id,
+                    auto_generate=auto_generate,
+                )
+            else:
+                calibration.run(
+                    sources.library_source, build_calibration_provider, ledger,
+                    session_facts,
+                )
+
         try:
-            print("已连接。输入消息后回车发送，输入 /exit 退出。")
+            if _first_run:
+                if calibration is not None and session_facts is not None:
+                    calibrate(web=True, auto_generate=True)
+                else:
+                    print("首次校准暂不可用，可以继续聊天。")
+            print(
+                "聊天窗口已就绪。输入消息后回车发送，输入 /calibrate-web 打开本机校准，"
+                "输入 /exit 退出。"
+            )
             while True:
                 try:
                     line = input("你：").strip()
@@ -194,6 +279,18 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 if line == "/exit":
                     return 0
+                if line in {"/calibrate", "/calibrate-web"}:
+                    if calibration is None or session_facts is None:
+                        print("当前账户的本地风格校准不可用。")
+                    else:
+                        calibrate(web=line == "/calibrate-web")
+                    continue
+                if session_facts is not None:
+                    handled, confirmed = confirm_fact(line, user_id, session_facts)
+                    if handled:
+                        if confirmed is None:
+                            continue
+                        line = confirmed
                 try:
                     response = bridge.reply(user_id=user_id, text=line)
                 except SpeechDialogueBridgeError:
@@ -202,6 +299,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{config.character_name}：{response.text}")
         finally:
             bridge.close()
+            if session_facts is not None:
+                session_facts.clear()
 
 
 if __name__ == "__main__":

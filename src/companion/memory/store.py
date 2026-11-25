@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS memories (
     FOREIGN KEY (user_id) REFERENCES consents(user_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS memories_by_user ON memories(user_id);
+CREATE TABLE IF NOT EXISTS share_memory_scopes (
+    memory_id TEXT PRIMARY KEY REFERENCES memories(memory_id) ON DELETE CASCADE,
+    target_scope TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS profiles (
     profile_id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -189,7 +193,9 @@ class _MemoryStore:
         except Exception:
             raise MemoryStoreError("memory store unavailable") from None
 
-    def insert_memory_if_authorized(self, request: CreateMemoryRequest) -> MemoryEntry:
+    def insert_memory_if_authorized(
+        self, request: CreateMemoryRequest, *, scope: str | None = None,
+    ) -> MemoryEntry:
         memory_id = secrets.token_hex(16)
         try:
             source_timestamp = request.source_timestamp.astimezone(UTC)
@@ -216,6 +222,10 @@ class _MemoryStore:
                         _utc_iso(source_timestamp),
                     ),
                 )
+                if scope is not None:
+                    connection.execute(
+                        "INSERT INTO share_memory_scopes VALUES (?, ?)", (memory_id, scope),
+                    )
             return MemoryEntry(
                 memory_id=memory_id,
                 user_id=request.user_id,
@@ -229,17 +239,21 @@ class _MemoryStore:
         except Exception:
             raise MemoryStoreError("memory store unavailable") from None
 
-    def list_memories(self, user_id: str) -> tuple[MemoryEntry, ...]:
+    def list_memories(
+        self, user_id: str, *, retrieve: bool = False, scope: str | None = None,
+    ) -> tuple[MemoryEntry, ...]:
         try:
             with self._connect() as connection:
                 rows = connection.execute(
                     """
-                    SELECT memory_id, user_id, field, value, source_timestamp
-                    FROM memories
-                    WHERE user_id = ?
-                    ORDER BY source_timestamp DESC, memory_id ASC
+                    SELECT m.memory_id, m.user_id, m.field, m.value, m.source_timestamp
+                    FROM memories AS m
+                    LEFT JOIN share_memory_scopes AS s ON s.memory_id = m.memory_id
+                    WHERE m.user_id = ?
+                      AND (? OR s.target_scope IS NULL OR s.target_scope = ?)
+                    ORDER BY m.source_timestamp DESC, m.memory_id ASC
                     """,
-                    (user_id,),
+                    (user_id, not retrieve, scope),
                 ).fetchall()
             return tuple(
                 MemoryEntry(

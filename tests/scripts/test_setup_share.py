@@ -58,10 +58,14 @@ def session(tmp_path, monkeypatch):
         except KeyError:
             raise CredentialError("api key not found") from None
 
+    def delete(env_name, base_url):
+        keys.pop((env_name, normalize_base_url(base_url)), None)
+
     store = Mock(side_effect=save)
     load = Mock(side_effect=read)
     monkeypatch.setattr(setup, "store_api_key", store)
     monkeypatch.setattr(setup, "load_api_key", load)
+    monkeypatch.setattr(setup, "delete_api_key", delete)
     monkeypatch.setattr(setup, "current_user_id", lambda: "synthetic-local-user")
     monkeypatch.setattr(setup.getpass, "getpass", lambda prompt: SYNTHETIC_KEY)
     monkeypatch.setattr(socket, "create_connection", Mock(side_effect=AssertionError("network")))
@@ -128,6 +132,18 @@ def config_path(session):
     return session.paths.private / "dialogue/runtime-config.json"
 
 
+def active_style_file(session, key):
+    payload = json.loads(config_path(session).read_bytes())
+    return session.paths.private / payload["snippet_style"][key]
+
+
+def active_key_slot(session):
+    payload = json.loads(config_path(session).read_bytes())
+    return share_credentials.credential_slot(
+        payload["provider"]["api_key_env"], payload["snippet_style"]["library_source"],
+    )
+
+
 def assert_ready(session, api_key_env="DEEPSEEK_API_KEY"):
     private = session.paths.private
     consent = json.loads((private / "share/consent.json").read_text(encoding="utf-8"))
@@ -137,20 +153,23 @@ def assert_ready(session, api_key_env="DEEPSEEK_API_KEY"):
         "consent_sha256": hashlib.sha256(setup.CONSENT_TEXT.encode("utf-8")).hexdigest(),
     }
     assert datetime.fromisoformat(consent["agreed_at"]).tzinfo is not None
-    library = read_snippets(private / "style/snippets/library.jsonl")
-    holdout = read_snippets(private / "style/snippets/holdout.jsonl")
+    payload = json.loads(config_path(session).read_text(encoding="utf-8"))
+    source = private / payload["snippet_style"]["library_source"]
+    library = read_snippets(source)
+    holdout = read_snippets(source.with_name("holdout.jsonl"))
     assert library
     assert {item.snippet_id for item in library}.isdisjoint(item.snippet_id for item in holdout)
-    assert (private / "style/snippets/habit_card.txt").is_file()
+    assert source.with_name("habit_card.txt").is_file()
     assert json.loads((private / "share/terms.json").read_text()) == {}
     assert load_veiled_terms(private / "privacy/veiled_terms.json").scan("合成").high == ()
     payload = json.loads(config_path(session).read_text(encoding="utf-8"))
     assert set(payload) == {"provider", "budget", "snippet_style"}
     assert "shared_terms_source" not in payload["snippet_style"]
-    assert payload["snippet_style"]["style_version"] == "share-v1"
+    version = payload["snippet_style"]["style_version"]
+    assert version == "share-v1" or version.startswith("share-v2-out-")
     assert payload["snippet_style"]["partner_user_id"] == "synthetic-local-user"
     config, _ = load_dialogue_config(load_settings(ROOT), environ={api_key_env: "offline-check"})
-    assert config.snippet_style.library_source == private / "style/snippets/library.jsonl"
+    assert config.snippet_style.library_source == source
     assert config.style is None and config.style_framework is None
     assert config.provider.timeout_seconds == 30
     budget = BudgetConfig.model_validate(payload["budget"])
@@ -298,7 +317,7 @@ def test_no_backup_fails(session, tmp_path, monkeypatch, capsys):
 def test_consent_discloses_unreplaced_names():
     assert ("人名、地名、学校、单位等信息不会被替换，会随聊天片段原样发送给你选择的云端模型服务。"
             in setup.CONSENT_TEXT)
-    for text in ("只学习主人发出的消息", "对方消息只作上下文", "数据只存在本机",
+    for text in ("只学习你指定一方的消息", "另一方的消息只作上下文", "数据只存在本机",
                  "第三方导出工具可能违反微信用户协议", "由使用者自行判断"):
         assert text in setup.CONSENT_TEXT
 
@@ -336,7 +355,9 @@ def test_rebuild_preserves_deletions_ledger_and_key(session, tmp_path, monkeypat
     answer(monkeypatch, "同意", "同意", "", "")
     assert setup.main([*args, "--rebuild"]) == 0
     assert "回车" in prompts[0] and "保留" in prompts[0]
-    assert "真实回复中自动统计" in card.read_text(encoding="utf-8")
+    active_card = active_style_file(session, "habit_card_source")
+    assert "真实回复中自动统计" in active_card.read_text(encoding="utf-8")
+    assert active_card.with_name("deleted_ids.json").read_text(encoding="utf-8") == saved
     assert deleted.read_text(encoding="utf-8") == saved
     assert ledger.read_text(encoding="utf-8") == "synthetic saved ledger"
     _, library, _ = assert_ready(session)
@@ -401,8 +422,8 @@ def test_setup_supports_only_time_range_deletions(
         assert (f"分享模式只支持按时间段删除；删除记录里有 {len(snippet_ids)} 条按片段记录的条目，"
                 "请改为按时间段记录后再重新设置。" in captured.out)
         assert "设置没有完成：片段库" in captured.out
-        assert not config_path(session).exists()
-        assert not deleted.with_name("habit_card.txt").exists()
+        assert config_path(session).exists() == rebuild
+        assert deleted.with_name("habit_card.txt").exists() == rebuild
         build.assert_not_called()
         session.store.assert_not_called()
     else:
@@ -538,7 +559,7 @@ def test_existing_veiled_terms_are_preserved_and_validated(
     assert path.read_bytes() == content
     if damaged:
         assert "设置没有完成：用户词表" in capsys.readouterr().out
-        assert not config_path(session).exists()
+        assert config_path(session).exists() == rebuild
         session.store.assert_not_called()
     else:
         lexicon = load_veiled_terms(path)
@@ -783,7 +804,8 @@ def test_rebuild_preserves_pronouns_unless_explicit(
         "partner": "她" if "--partner-pronoun" in override else partner,
     }
     assert prompts == [setup.OWNER_CONSENT_PROMPT, setup.PARTNER_CONSENT_PROMPT,
-                       setup.PROVIDER_URL_PROMPT, setup.PROVIDER_MODEL_PROMPT]
+                       "模型服务地址（直接回车沿用 https://api.deepseek.com/v1）：",
+                       "模型名（直接回车沿用 deepseek-chat）："]
 
 
 @pytest.mark.parametrize("previous_config", ["{invalid JSON", "{}"])
@@ -863,12 +885,13 @@ def test_platform_paths(tmp_path, monkeypatch, platform):
 
 
 @pytest.mark.parametrize("failure", ["habit", "credentials", "offline", "overlap"])
-def test_late_failure_removes_rebuilt_config(
+def test_late_failure_preserves_published_config(
     session, tmp_path, monkeypatch, capsys, failure,
 ):
     args = standard_args(chat_file(tmp_path))
     answer(monkeypatch, "同意", "同意", "", "", "", "")
     assert setup.main(args) == 0
+    saved = config_path(session).read_bytes()
     if failure == "habit":
         monkeypatch.setattr(setup.build_habit_card, "main", lambda argv: 2)
     elif failure == "credentials":
@@ -880,14 +903,14 @@ def test_late_failure_removes_rebuilt_config(
 
         def overlap(argv):
             result = original(argv)
-            directory = session.paths.private / "style/snippets"
+            directory = Path(argv[argv.index("--out-dir") + 1])
             (directory / "holdout.jsonl").write_bytes((directory / "library.jsonl").read_bytes())
             return result
 
         monkeypatch.setattr(setup.build_paired_snippets, "main", overlap)
     answer(monkeypatch, "同意", "同意", "", "")
     assert setup.main([*args, "--rebuild"]) == 1
-    assert not config_path(session).exists()
+    assert config_path(session).read_bytes() == saved
     assert "设置没有完成：" in capsys.readouterr().out
 
 
@@ -1141,9 +1164,11 @@ def test_rebuild_new_address_requires_key_after_empty_input(session, tmp_path, m
 
     assert len(prompts) == 3
     assert "这个服务地址还没有保存过 key，请粘贴" in capsys.readouterr().out
-    session.store.assert_called_once_with("OPENAI_API_KEY", address_b, "synthetic-b-key")
+    slot = active_key_slot(session)
+    assert slot.startswith("OPENAI_API_KEY|share-slot|")
+    session.store.assert_called_once_with(slot, address_b, "synthetic-b-key")
     assert session.load("OPENAI_API_KEY", address_a) == SYNTHETIC_KEY
-    assert session.load("OPENAI_API_KEY", address_b) == "synthetic-b-key"
+    assert session.load(slot, address_b) == "synthetic-b-key"
     assert json.loads(config_path(session).read_text())["provider"]["base_url"] == address_b
 
 
@@ -1173,11 +1198,12 @@ def test_rebuild_native_read_error_uses_existing_credential_prompt(
 
     assert prompts == [setup.REBUILD_API_KEY_PROMPT, setup.API_KEY_PROMPT]
     assert "这个服务地址还没有保存过 key，请粘贴" in capsys.readouterr().out
-    session.store.assert_called_once_with("DEEPSEEK_API_KEY", setup.DEFAULT_BASE_URL, new_key)
-    assert session.load("DEEPSEEK_API_KEY", setup.DEFAULT_BASE_URL) == new_key
+    slot = active_key_slot(session)
+    session.store.assert_called_once_with(slot, setup.DEFAULT_BASE_URL, new_key)
+    assert session.load("DEEPSEEK_API_KEY", setup.DEFAULT_BASE_URL) == SYNTHETIC_KEY
     assert get_keyring.call_count == 2
     backend.get_password.assert_called_once_with(
-        share_credentials.SERVICE, f"DEEPSEEK_API_KEY|{setup.DEFAULT_BASE_URL}",
+        share_credentials.SERVICE, f"{slot}|{setup.DEFAULT_BASE_URL}",
     )
 
 
@@ -1219,8 +1245,13 @@ def test_key_readback_failure_never_writes_runtime_config(
     assert setup.main(args) == 1
 
     assert "设置没有完成：保存 API key" in capsys.readouterr().out
-    session.load.assert_called_with("DEEPSEEK_API_KEY", setup.DEFAULT_BASE_URL)
-    assert not config_path(session).exists()
+    slot, address = session.load.call_args.args
+    assert address == setup.DEFAULT_BASE_URL
+    if rebuild:
+        assert slot.startswith("DEEPSEEK_API_KEY|share-slot|")
+    else:
+        assert slot == "DEEPSEEK_API_KEY"
+    assert config_path(session).exists() == rebuild
     assert all(call.args[0] != config_path(session) for call in write.call_args_list)
 
 
@@ -1333,7 +1364,7 @@ def test_rebuild_keep_habit_card_preserves_existing_card(session, tmp_path, monk
     capsys.readouterr()
     answer(monkeypatch, "同意", "同意", "", "")
     assert setup.main([*args, "--rebuild", "--keep-habit-card"]) == 0
-    assert card.read_bytes() == "原版卡\n".encode()
+    assert active_style_file(session, "habit_card_source").read_bytes() == "原版卡\n".encode()
     assert calls == []
     assert config_path(session).is_file()
     assert "习惯卡：保留现有（未重新生成）" in capsys.readouterr().out
@@ -1366,4 +1397,370 @@ def test_rebuild_without_keep_habit_card_regenerates_card(session, tmp_path, mon
     card.write_bytes("原版卡\n".encode())
     answer(monkeypatch, "同意", "同意", "", "")
     assert setup.main([*args, "--rebuild"]) == 0
-    assert card.read_bytes() != "原版卡\n".encode()
+    assert active_style_file(session, "habit_card_source").read_bytes() != "原版卡\n".encode()
+
+
+@pytest.mark.parametrize("format_name,target", [
+    ("standard", "2"), ("standard", "1"), ("jsonl", "2"), ("ios-backup", "1"),
+])
+def test_guided_first_setup_opens_questions_before_chat(
+    session, tmp_path, monkeypatch, backup_helpers, format_name, target, capsys,
+):
+    from http.client import HTTPConnection
+    from queue import Queue
+    from urllib.parse import urlsplit
+
+    from companion.dialogue import composition
+    from companion.dialogue.models import ProviderResult, ProviderUsage
+
+    rows = standard_rows()
+    for index, row in enumerate(rows):
+        row["timestamp"] = (datetime(2026, 1, 1, tzinfo=UTC)
+                            + timedelta(minutes=index)).isoformat()
+    rows[20]["text"], rows[21]["text"] = ("知道了？", "合成私文先说？")
+    rows[22]["text"], rows[23]["text"] = ("很详细的合成问题", "行")
+    rows[34]["text"], rows[35]["text"] = ("行", "很详细的合成回答")
+    rows[32]["text"], rows[33]["text"] = ("合成私文？", "让我们开始说别的")
+    rows[24]["text"], rows[25]["text"] = ("我们改了计划", "怎么改的？")
+    rows[36]["text"], rows[37]["text"] = ("这个合成问题怎么答？", "收到")
+    rows[38]["text"], rows[39]["text"] = ("周末要带合成铅笔", "周末要带合成纸张")
+    if format_name == "ios-backup":
+        backup = make_backup(backup_helpers, tmp_path / "backup", rows=rows)
+        files = ("1", "1")
+        argv = ["--guided", "--backup", str(backup.path)]
+    else:
+        if format_name == "standard":
+            source = tmp_path / "synthetic-standard.json"
+            source.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+        else:
+            source = jsonl_file(tmp_path, rows)
+        files = (str(source),)
+        argv = ["--guided"]
+    menu = {"ios-backup": "1", "jsonl": "2", "standard": "3"}[format_name]
+    if format_name == "standard" and target == "1":
+        monkeypatch.setattr(setup.sys, "argv", ["setup_share.py"])
+        argv = None  # The double-click launcher calls setup_share.py without a flag.
+    prompts = answer(
+        monkeypatch, menu, "同意", "同意", *files, target, "同意", "", "",
+        "https://example.invalid/v1", "synthetic-onboarding", "开始", "周末需要带啥？", "/exit",
+    )
+    user_id = "synthetic-local-user"
+    monkeypatch.setattr(text_chat, "current_user_id", lambda: user_id)
+    monkeypatch.setattr(text_chat, "load_api_key", session.load)
+    urls = Queue()
+    opened = Mock(side_effect=lambda url: urls.put(url))
+    monkeypatch.setattr("webbrowser.open", opened)
+    provider = Mock()
+    calls = []
+
+    def complete(messages):
+        if not calls:
+            features = json.loads(messages[-1].content)
+            assert features["signals"]["pairs"] > 0
+            assert sum(features["signals"]["reply_length"].values()) == features["signals"]["pairs"]
+            prompt = messages[-1].content
+            assert "合成私文" not in prompt and SYNTHETIC_KEY not in prompt
+            questions = [
+                {
+                    "question": "合成问题需要追问吗？",
+                    "options": [] if item["kind"] == "fact" else ["追问", "先回应"],
+                }
+                for item in features["candidates"]
+            ]
+            result = json.dumps({"uncertainty": "追问出现的时机仍需确认", "questions": questions})
+        else:
+            assert "核验首启确认答案" in messages[0].content
+            assert "周末要带合成书签" in messages[0].content
+            result = "合成正常回复"
+        calls.append(messages)
+        return ProviderResult(
+            text=result, usage=ProviderUsage(prompt_tokens=8, completion_tokens=4, total_tokens=12),
+        )
+
+    provider.complete.side_effect = complete
+    build_provider = Mock(return_value=provider)
+    monkeypatch.setattr(composition, "OpenAICompatibleProvider", build_provider)
+
+    def get_key(prompt):
+        assert not list(session.paths.private.rglob("habit_card.txt"))
+        assert not list(session.paths.private.rglob("library.jsonl"))
+        provider.complete.assert_not_called()
+        return SYNTHETIC_KEY
+
+    monkeypatch.setattr(setup.getpass, "getpass", get_key)
+    import socket
+    from threading import Thread
+
+    outcome = Queue()
+    thread = Thread(target=lambda: outcome.put(setup.main(argv)), daemon=True)
+    thread.start()
+    url = urlsplit(urls.get(timeout=4))
+    origin = f"{url.scheme}://{url.netloc}"
+    headers = {"Origin": origin, "X-Calibration-Token": url.fragment,
+               "Content-Type": "application/json"}
+    connection = HTTPConnection(url.hostname, url.port, timeout=5)
+
+    def connect_loopback(address, timeout, source_address=None):
+        assert address == ("127.0.0.1", url.port)
+        with socket.socket() as client:
+            client.settimeout(timeout)
+            client.connect(address)
+            return client.dup()
+
+    connection._create_connection = connect_loopback
+
+    def post(path, body=None):
+        connection.request("POST", path, json.dumps(body or {}), headers)
+        response = connection.getresponse()
+        assert response.status == 200
+        return json.loads(response.read())
+
+    try:
+        from companion.runtime.share_lock import ShareSessionBusy, share_session_lock
+
+        with pytest.raises(ShareSessionBusy), share_session_lock(session.paths.runtime):
+            pytest.fail("first-run web must keep the setup lock")
+        state = post("/state")
+        assert state["phase"] == "active"
+        assert state["uncertainty"] == "追问出现的时机仍需确认"
+        assert state["question"]["kind"] in {"followup", "closure"}
+        assert len(calls) == 1
+        assert state["question"]["question"] == "合成问题需要追问吗？"
+        state = post("/answer", {"index": 0, "action": "save", "answer": "核验首启确认答案"})
+        fact_saved = False
+        while state["phase"] == "active":
+            data = {"index": state["index"], "action": "skip"}
+            if state["question"]["kind"] == "fact":
+                data.update(action="save", answer="周末要带合成书签", scope="temporary")
+                fact_saved = True
+            state = post("/answer", data)
+        assert fact_saved
+    finally:
+        post("/finish")
+        connection.close()
+    assert outcome.get(timeout=10) == 0
+    thread.join(timeout=2)
+    assert len(calls) == 2 and not thread.is_alive()
+    config = json.loads(config_path(session).read_text(encoding="utf-8"))
+    style = config["snippet_style"]
+    snippets = read_snippets(session.paths.private / style["library_source"])
+    expected = "outbound" if target == "1" else "inbound"
+    opposite = "inbound" if target == "1" else "outbound"
+    owner_lines = {row["text"] for row in rows if row["direction"] == expected}
+    partner_lines = {row["text"] for row in rows if row["direction"] == opposite}
+    assert all(set(item.owner_reply) <= owner_lines for item in snippets)
+    assert all(set(item.partner_turns) <= partner_lines for item in snippets)
+    assert any("模仿哪一方" in prompt for prompt in prompts)
+    assert all(call.kwargs["config"].model == "synthetic-onboarding"
+               and call.kwargs["api_key"].get_secret_value() == SYNTHETIC_KEY
+               for call in build_provider.call_args_list)
+    assert SYNTHETIC_KEY not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("mode", ["skip", "bad-model", "empty-candidates", "budget"])
+def test_guided_setup_keeps_chat_available_without_questions(
+    session, tmp_path, monkeypatch, mode, capsys,
+):
+    from companion.dialogue import composition
+    from companion.dialogue.models import ProviderResult
+    from companion.runtime import text_chat
+
+    rows = standard_rows()
+    if mode in {"bad-model", "budget"}:
+        rows[21]["text"] = "怎么继续？"
+    if mode == "budget":
+        from companion.dialogue.usage import BudgetExceeded, MonthlyUsageLedger
+
+        reserve = Mock(side_effect=BudgetExceeded("synthetic budget exhausted"))
+        monkeypatch.setattr(MonthlyUsageLedger, "reserve", reserve)
+    source = tmp_path / "synthetic.json"
+    source.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    args = ["--guided", *standard_args(source)]
+    accepted = "" if mode == "skip" else "开始"
+    answer(monkeypatch, "同意", "同意", "1", "同意", "", "", "", "", accepted, "/exit")
+    open_browser = Mock()
+    monkeypatch.setattr("webbrowser.open", open_browser)
+    monkeypatch.setattr(text_chat, "current_user_id", lambda: "synthetic-local-user")
+    monkeypatch.setattr(text_chat, "load_api_key", session.load)
+    provider = Mock()
+    provider.complete.return_value = ProviderResult(text="invalid synthetic questions")
+    monkeypatch.setattr(composition, "OpenAICompatibleProvider", Mock(return_value=provider))
+    assert setup.main(args) == 0
+    assert config_path(session).exists()
+    assert provider.complete.call_count == (mode == "bad-model")
+    open_browser.assert_not_called()
+    output = capsys.readouterr().out
+    if mode in {"bad-model", "budget"}:
+        assert "分析或出题暂未完成" in output
+    if mode == "empty-candidates":
+        assert "没有找到适合校准的片段" in output
+    answer(monkeypatch, "/exit")
+    assert text_chat.main([]) == 0
+
+
+def test_guided_rebuild_keeps_target_scopes_and_rolls_back_failed_setup(
+    session, tmp_path, monkeypatch,
+):
+    from companion.runtime.share_calibration import Rule, ShareCalibration
+
+    rows = standard_rows()
+    for index, row in enumerate(rows):
+        row["timestamp"] = (datetime(2026, 1, 1, tzinfo=UTC)
+                            + timedelta(minutes=index)).isoformat()
+    source = tmp_path / "synthetic.json"
+    source.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    args = ["--guided", *standard_args(source)]
+    answer(monkeypatch, "同意", "同意", "1", "同意", "", "", "", "", "")
+    assert setup.main(args) == 0
+
+    def current():
+        payload = json.loads(config_path(session).read_bytes())
+        return payload["snippet_style"]
+
+    first = current()
+    user = first["partner_user_id"]
+    old_config = config_path(session).read_bytes()
+    old_library = session.paths.private / first["library_source"]
+    library_bytes = old_library.read_bytes()
+    original = ShareCalibration(session.paths.private, user, style_version=first["style_version"])
+    original.save(Rule(kind="followup", answer="合成旧对象校准"))
+    answer(monkeypatch, "同意", "同意", "2", "同意", "", "", "", "")
+    with monkeypatch.context() as failure:
+        failure.setattr(setup.build_habit_card, "main", lambda argv: 1)
+        assert setup.main([*args, "--rebuild"]) == 1
+    assert config_path(session).read_bytes() == old_config
+    assert old_library.read_bytes() == library_bytes
+
+    answer(monkeypatch, "同意", "同意", "2", "同意", "她", "他", "", "", "")
+    assert setup.main([*args, "--rebuild"]) == 0
+    updated = current()
+    assert updated["style_version"].startswith("share-v2-in-")
+    assert updated["pronouns"] == {"owner": "她", "partner": "他"}
+    changed = ShareCalibration(session.paths.private, user, style_version=updated["style_version"])
+    assert changed.guidance(user) == ("", ())
+    assert "合成旧对象校准" in original.guidance(user)[0]
+    changed.save(Rule(kind="closure", answer="合成新的校准"))
+    answer(monkeypatch, "同意", "同意", "3", "同意", "", "", "")
+    assert setup.main([*args, "--rebuild"]) == 0
+    assert current()["style_version"] == updated["style_version"]
+    restored = ShareCalibration(session.paths.private, user, style_version=updated["style_version"])
+    assert "合成新的校准" in restored.guidance(user)[0]
+
+
+@pytest.mark.parametrize("fault", ["key-write", "key-readback", "key-mismatch", "publish"])
+def test_review_failed_rebuild_preserves_config_and_key(
+    session, tmp_path, monkeypatch, fault,
+):
+    from companion.runtime.share_credentials import credential_slot
+
+    source = chat_file(tmp_path)
+    args = ["--guided", *standard_args(source), "--owner-pronoun", "他", "--partner-pronoun", "她"]
+    answer(monkeypatch, "同意", "同意", "1", "同意", "", "", "")
+    monkeypatch.setattr(setup.getpass, "getpass", lambda prompt: "synthetic-old")
+    assert setup.main(args) == 0
+    config = config_path(session)
+    original = config.read_bytes()
+    payload = json.loads(original)
+    provider = payload["provider"]
+    slot = credential_slot(provider["api_key_env"], payload["snippet_style"]["library_source"])
+
+    store = session.store.side_effect
+    read = session.load.side_effect
+
+    def save(env, address, value):
+        store(env, address, value)
+        if fault == "key-write":
+            raise CredentialError("synthetic failed write")
+
+    def load(env, address):
+        if fault == "key-readback" and env != slot:
+            raise CredentialError("synthetic failed readback")
+        if fault == "key-mismatch" and env != slot:
+            return "synthetic-wrong-key"
+        return read(env, address)
+
+    session.store.side_effect = save
+    session.load.side_effect = load
+    if fault == "publish":
+        replace = Path.replace
+
+        def fail_config_replace(self, target):
+            if target == config:
+                raise OSError("synthetic config publication failure")
+            return replace(self, target)
+
+        monkeypatch.setattr(Path, "replace", fail_config_replace)
+    delete = Mock(wraps=setup.delete_api_key)
+    monkeypatch.setattr(setup, "delete_api_key", delete)
+    monkeypatch.setattr(setup.getpass, "getpass", lambda prompt: "synthetic-new")
+    answer(monkeypatch, "同意", "同意", "3", "同意", "", "", "")
+    assert setup.main([*args, "--rebuild"]) == 1
+    assert config.read_bytes() == original
+    assert read(slot, provider["base_url"]) == "synthetic-old"
+    (failed_slot, address), _ = delete.call_args
+    assert slot != failed_slot
+    with pytest.raises(CredentialError):
+        read(failed_slot, address)
+
+
+def test_review_rebuild_moved_file_reuses_target_and_defaults(
+    session, tmp_path, monkeypatch, capsys,
+):
+    source = chat_file(tmp_path)
+    flags = ("--guided", "--owner-pronoun", "他", "--partner-pronoun", "她")
+    address = "https://synthetic.example/v1"
+    model = "synthetic-model"
+    answer(monkeypatch, "同意", "同意", "1", "同意", address, model, "")
+    assert setup.main(standard_args(source, *flags)) == 0
+    previous = json.loads(config_path(session).read_bytes())
+    moved = source.rename(tmp_path / "synthetic-moved.json")
+    args = standard_args(moved, *flags, "--rebuild")
+    monkeypatch.setattr(setup.getpass, "getpass", lambda prompt: "synthetic-new-key")
+    prompts = answer(monkeypatch, "同意", "同意", "3", "同意", "", "", "")
+    assert setup.main(args) == 0
+    current = json.loads(config_path(session).read_bytes())
+    assert previous["snippet_style"]["style_version"] == current["snippet_style"]["style_version"]
+    assert current["provider"]["base_url"] == address and current["provider"]["model"] == model
+    assert any(address in prompt for prompt in prompts)
+    assert any(model in prompt for prompt in prompts)
+    assert "沿用此目标的已有校准" in capsys.readouterr().out
+    assert session.load(active_key_slot(session), address) == "synthetic-new-key"
+    from companion.dialogue import composition
+
+    make_provider = Mock()
+    monkeypatch.setattr(composition, "OpenAICompatibleProvider", make_provider)
+    monkeypatch.setattr(text_chat, "current_user_id", lambda: "synthetic-local-user")
+    monkeypatch.setattr(text_chat, "load_api_key", session.load)
+    answer(monkeypatch, "/exit")
+    assert text_chat.main([]) == 0
+    assert make_provider.call_args.kwargs["api_key"].get_secret_value() == "synthetic-new-key"
+
+    before = config_path(session).read_bytes()
+    rows = standard_rows()
+    rows[0]["text"] = "合成更新后的新内容"
+    moved.write_text(json.dumps(rows), encoding="utf-8")
+    ask_key = Mock()
+    monkeypatch.setattr(setup.getpass, "getpass", ask_key)
+    answer(monkeypatch, "同意", "同意", "3", "取消")
+    assert setup.main(args) == 2
+    assert "需要重新校准" in capsys.readouterr().out
+    assert config_path(session).read_bytes() == before
+    ask_key.assert_not_called()
+
+
+def test_review_nonempty_backup_wal_keeps_original_and_offers_file_routes(
+    session, tmp_path, monkeypatch, capsys, backup_helpers,
+):
+    backup = make_backup(backup_helpers, tmp_path / "backup")
+    account = backup_helpers.ACCOUNT
+    wal = backup.register(f"Documents/{account}/DB/WCDB_Contact.sqlite-wal", b"synthetic WAL")
+    original = wal.read_bytes()
+    key = Mock()
+    monkeypatch.setattr(setup.getpass, "getpass", key)
+    answer(monkeypatch, "同意", "同意", "1")
+    flags = ("--guided", "--format", "ios-backup", "--backup", str(backup.path))
+    assert setup.main(list(flags)) == 1
+    output = capsys.readouterr().out
+    assert "SQLite 日志（WAL）" in output and "JSONL 或 Standard JSON" in output
+    assert wal.read_bytes() == original
+    key.assert_not_called()

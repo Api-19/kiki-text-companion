@@ -98,13 +98,27 @@ class MemoryService:
 
     @_sanitize_public_errors
     def create_memory(self, request: CreateMemoryRequest) -> MemoryEntry:
+        return self._create_memory(request)
+
+    @_sanitize_public_errors
+    def create_scoped_note(self, request: CreateMemoryRequest, scope: str) -> MemoryEntry:
+        if (
+            not isinstance(scope, str) or not scope
+            or request.field is not MemoryField.EXPLICIT_NOTE
+        ):
+            raise MemoryValidationError("invalid memory request")
+        return self._create_memory(request, scope=scope)
+
+    def _create_memory(
+        self, request: CreateMemoryRequest, *, scope: str | None = None,
+    ) -> MemoryEntry:
         try:
             validated = CreateMemoryRequest.model_validate(request.model_dump())
             _validate_user_id(validated.user_id)
         except Exception:
             raise MemoryValidationError("invalid memory request") from None
         self._cleanup_profiles()
-        return self._store.insert_memory_if_authorized(validated)
+        return self._store.insert_memory_if_authorized(validated, scope=scope)
 
     @_sanitize_public_errors
     def list_memories(self, user_id: str) -> tuple[MemoryEntry, ...]:
@@ -127,7 +141,7 @@ class MemoryService:
 
     @_sanitize_public_errors
     def retrieve_memories(
-        self, user_id: str, query: str, limit: int = 5
+        self, user_id: str, query: str, limit: int = 5, *, scope: str | None = None,
     ) -> tuple[MemoryEntry, ...]:
         _validate_user_id_or_raise(user_id)
         try:
@@ -138,7 +152,7 @@ class MemoryService:
         consent = self._store.load_consent(user_id)
         if consent is None or not consent.granted:
             return ()
-        entries = self._store.list_memories(user_id)
+        entries = self._store.list_memories(user_id, retrieve=True, scope=scope)
         return select_matching_memories(entries, normalized, limit)
 
     @_sanitize_public_errors

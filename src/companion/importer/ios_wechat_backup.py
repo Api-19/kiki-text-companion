@@ -21,7 +21,7 @@ _DOMAIN = "AppDomain-com.tencent.xin"
 _FILE_ID = re.compile(r"[0-9a-fA-F]{40}")
 _TABLE = re.compile(r"Chat_[0-9a-f]{32}")
 _DATABASE_PATH = re.compile(
-    r"Documents/([^/]+)/DB/(WCDB_Contact\.sqlite|message_[^/]+\.sqlite(?:-wal)?)"
+    r"Documents/([^/]+)/DB/((?:WCDB_Contact|message_[^/]+)\.sqlite(?:-wal)?)"
 )
 _SERVICE_USERS = {
     "weixin",
@@ -135,6 +135,9 @@ def _backup(backup: Path):
         raise IosBackupError("backup operation failed") from None
     try:
         try:
+            manifest_wal = backup / "Manifest.db-wal"
+            if manifest_wal.exists() and manifest_wal.stat().st_size:
+                raise IosBackupError("nonempty backup WAL")
             with _copied_database(backup / "Manifest.db", directory) as manifest:
                 files = {}
                 for relative, file_id in manifest.execute(
@@ -207,7 +210,9 @@ def _contact_name(blob: bytes) -> str:
 
 
 def _contacts(files: dict, directory: Path, account: str) -> dict[str, tuple[str, str]]:
-    source = files.get(f"Documents/{account}/DB/WCDB_Contact.sqlite")
+    relative = f"Documents/{account}/DB/WCDB_Contact.sqlite"
+    source = files.get(relative)
+    _require_empty_wal(files.get(relative + "-wal"))
     if source is None:
         return {}
     contacts = {}
@@ -220,14 +225,17 @@ def _contacts(files: dict, directory: Path, account: str) -> dict[str, tuple[str
     return contacts
 
 
+def _require_empty_wal(path: Path | None) -> None:
+    if path is not None and path.stat().st_size:
+        raise IosBackupError("nonempty backup WAL")
+
+
 def _shards(files: dict, account: str) -> list[Path]:
     prefix = f"Documents/{account}/DB/message_"
     shards = []
     for relative in sorted(files):
         if relative.startswith(prefix) and relative.endswith(".sqlite"):
-            wal = files.get(relative + "-wal")
-            if wal is not None and wal.stat().st_size:
-                raise IosBackupError("wal not supported")
+            _require_empty_wal(files.get(relative + "-wal"))
             shards.append(files[relative])
     return shards
 

@@ -63,8 +63,8 @@ from companion.dialogue.provider import (
     OpenAIProviderUnavailable,
     ProviderError,
     ProviderTimeout,
-    ProviderUnavailableKind,
     provider_deadline_scope,
+    provider_failure_unbilled,
 )
 from companion.dialogue.shared_terms import SharedTerm, match_shared_terms, shared_term_query_texts
 from companion.dialogue.style_personalization import ProductionStylePersonalization
@@ -110,20 +110,6 @@ _FALLBACK_TEXT = {
     "mechanical_style_repeat": MECHANICAL_REPEAT_FALLBACK,
     "style_verification_rejected": STYLE_VERIFICATION_FALLBACK,
 }
-
-_UNBILLED_PROVIDER_FAILURE_KINDS = frozenset(
-    {
-        ProviderUnavailableKind.DNS_UNAVAILABLE,
-        ProviderUnavailableKind.CONNECT_UNAVAILABLE,
-        ProviderUnavailableKind.TLS_UNAVAILABLE,
-        ProviderUnavailableKind.REDIRECT_REFUSED,
-        ProviderUnavailableKind.HTTP_400_BAD_REQUEST,
-        ProviderUnavailableKind.HTTP_401_UNAUTHORIZED,
-        ProviderUnavailableKind.HTTP_403_FORBIDDEN,
-        ProviderUnavailableKind.HTTP_404_NOT_FOUND,
-        ProviderUnavailableKind.HTTP_429_RATE_LIMITED,
-    }
-)
 
 _RETRYABLE_PROVIDER_FAILURES: frozenset[str] = frozenset(
     {
@@ -208,6 +194,7 @@ class DialogueOrchestrator:
         snippet_habit_card: str | None = None,
         snippet_shared_terms: Sequence[SharedTerm] | None = None,
         snippet_session_check: bool = False,
+        snippet_calibration: Callable[[str], tuple[str, tuple[SharedTerm, ...]]] | None = None,
         veiled_terms_path: Path | None = None,
         provider: DialogueProvider,
         ledger: MonthlyUsageLedger,
@@ -244,6 +231,7 @@ class DialogueOrchestrator:
         self._snippet_habit_card = snippet_habit_card
         self._snippet_shared_terms = tuple(snippet_shared_terms or ())
         self._snippet_session_check = snippet_session_check
+        self._snippet_calibration = snippet_calibration
         lexicons = []
         if snippet_style is not None:
             if veiled_terms_path is not None:
@@ -935,6 +923,15 @@ class DialogueOrchestrator:
                         "\n".join((*snippet.partner_turns, *snippet.owner_reply))
                     ).high
                 ]
+        habit_card = self._snippet_habit_card
+        shared_terms = self._snippet_shared_terms
+        if self._snippet_calibration is not None and mode is DialogueMode.STYLED:
+            additions, calibrated_terms = self._snippet_calibration(user_id)
+            if additions:
+                habit_card = "\n".join(filter(None, (
+                    habit_card, "用户确认的场景偏好：", additions,
+                )))
+            shared_terms = (*calibrated_terms, *shared_terms)
         snippets = (*evidence.similar, *evidence.general)
         return (
             StyleReplyGuidance(
@@ -945,9 +942,9 @@ class DialogueOrchestrator:
                 evidence,
                 memories=memories,
                 profile=profile,
-                habit_card=self._snippet_habit_card,
+                habit_card=habit_card,
                 shared_terms=match_shared_terms(
-                    self._snippet_shared_terms,
+                    shared_terms,
                     shared_term_query_texts(prepared.text, prepared.recent_context),
                 ),
                 character_name=self._config.character_name,
@@ -1114,10 +1111,7 @@ class DialogueOrchestrator:
                     observation_context.provider_failure = provider_failure
                 if attempt_outcome is not None:
                     attempt_outcome.provider_failure = provider_failure
-                provider_request_unbilled = (
-                    isinstance(error, OpenAIProviderUnavailable)
-                    and error.kind in _UNBILLED_PROVIDER_FAILURE_KINDS
-                )
+                provider_request_unbilled = provider_failure_unbilled(error)
                 _detach_exception(error)
                 error = None  # type: ignore[assignment]
                 blocked_reason = "provider_unavailable"

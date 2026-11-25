@@ -344,7 +344,7 @@ def test_metadata_maximum_is_not_biased_by_empty_shards_or_zero(tmp_path):
 @pytest.mark.parametrize("operation", ["list", "export"])
 def test_reject_nonempty_wal(backup, tmp_path, operation):
     backup.register(f"Documents/{ACCOUNT}/DB/message_5.sqlite-wal", b"synthetic WAL")
-    with pytest.raises(ios.IosBackupError, match=r"^wal not supported$"):
+    with pytest.raises(ios.IosBackupError, match=r"^nonempty backup WAL$"):
         if operation == "list":
             ios.list_conversations(backup.path, ACCOUNT)
         else:

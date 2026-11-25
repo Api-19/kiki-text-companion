@@ -79,6 +79,27 @@ class OpenAIProviderUnavailable(ProviderError):
         self.stage = stage
 
 
+_UNBILLED_PROVIDER_FAILURE_KINDS = frozenset(
+    {
+        ProviderUnavailableKind.DNS_UNAVAILABLE,
+        ProviderUnavailableKind.CONNECT_UNAVAILABLE,
+        ProviderUnavailableKind.TLS_UNAVAILABLE,
+        ProviderUnavailableKind.REDIRECT_REFUSED,
+        ProviderUnavailableKind.HTTP_400_BAD_REQUEST,
+        ProviderUnavailableKind.HTTP_401_UNAUTHORIZED,
+        ProviderUnavailableKind.HTTP_403_FORBIDDEN,
+        ProviderUnavailableKind.HTTP_404_NOT_FOUND,
+        ProviderUnavailableKind.HTTP_429_RATE_LIMITED,
+    }
+)
+
+def provider_failure_unbilled(error: BaseException) -> bool:
+    return (
+        isinstance(error, OpenAIProviderUnavailable)
+        and error.kind in _UNBILLED_PROVIDER_FAILURE_KINDS
+    )
+
+
 def _raise_openai_provider_unavailable(
     kind: ProviderUnavailableKind,
     stage: ProviderUnavailableStage,

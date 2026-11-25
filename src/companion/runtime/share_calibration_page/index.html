@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>风格与记忆校准</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>风格与记忆校准</h1>
+      <button id="finish" class="quiet" type="button">结束并返回聊天</button>
+    </header>
+    <section id="status" class="panel" aria-labelledby="status-title">
+      <h2 id="status-title">正在连接本机聊天</h2>
+      <p id="status-description"></p>
+      <button id="generate" type="button" hidden>开始出题</button>
+    </section>
+    <div id="work" hidden>
+      <aside class="panel context" aria-labelledby="context-title">
+        <h2 id="context-title">本机对照片段</h2>
+        <dl>
+          <dt>对方</dt>
+          <dd id="context"></dd>
+          <dt>原回复</dt>
+          <dd id="reply"></dd>
+        </dl>
+      </aside>
+      <section class="panel question" aria-labelledby="question-title">
+        <p id="progress" class="progress"></p>
+        <p id="uncertainty" hidden></p>
+        <h2 id="question-title" tabindex="-1"></h2>
+        <form id="answer">
+          <div id="fields"></div>
+          <div class="actions">
+            <button id="confirm" type="submit">确认保存</button>
+            <button id="uncertain" class="quiet" type="button">不确定</button>
+            <button id="skip" class="quiet" type="button">跳过</button>
+          </div>
+        </form>
+      </section>
+    </div>
+    <p id="feedback" role="status" aria-live="polite"></p>
+    <noscript>此页面需要 JavaScript。也可回到终端使用 /calibrate。</noscript>
+  </main>
+</body>
+</html>

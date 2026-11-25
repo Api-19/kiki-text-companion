@@ -20,7 +20,9 @@ from companion.contracts import DialogueResponse
 from companion.runtime import private_paths, share_lock, text_chat
 from companion.runtime.share_credentials import CredentialError
 
-CONNECTED = "已连接。输入消息后回车发送，输入 /exit 退出。\n"
+CONNECTED = (
+    "聊天窗口已就绪。输入消息后回车发送，输入 /calibrate-web 打开本机校准，输入 /exit 退出。\n"
+)
 STARTUP_FAILED = "文本聊天暂时无法启动。\n"
 
 
@@ -44,9 +46,11 @@ def host(tmp_path, monkeypatch):
             "base_url": "https://synthetic.example/v1", "api_key_env": "DEEPSEEK_API_KEY",
             "model": "synthetic-model", "timeout_seconds": 10,
         },
+        "snippet_style": {"partner_user_id": "synthetic-user"},
     }), encoding="utf-8")
     config = SimpleNamespace(
         snippet_style=SimpleNamespace(
+            partner_user_id="synthetic-user", style_version="share-v1",
             library_source=library / "library.jsonl",
             habit_card_source=card / "habit_card.txt",
             veiled_terms_source=terms / "veiled_terms.json",
@@ -328,7 +332,7 @@ def test_startup_failure_releases_lock(host, capsys):
     assert capsys.readouterr().out == STARTUP_FAILED + CONNECTED
 
 
-@pytest.mark.parametrize("platform", ["posix", "nt"])
+@pytest.mark.parametrize("platform", ["posix", "nt", "other"])
 def test_build_bridge_wires_snippets_and_privacy_revision(monkeypatch, platform):
     settings, config, secrets = object(), object(), object()
     memory = Mock()
@@ -352,10 +356,11 @@ def test_build_bridge_wires_snippets_and_privacy_revision(monkeypatch, platform)
     assert before <= snippets.call_args.kwargs["clock"]() <= datetime.now(UTC)
     build.assert_called_once_with(
         settings, config, secrets, trusted_user_id="synthetic-user", snippet_style=adapter,
-        snippet_habit_card=card, memory_gateway=memory if platform == "posix" else None,
-        privacy_revision_sources=(memory, adapter) if platform == "posix" else (adapter,),
+        snippet_habit_card=card, memory_gateway=memory if platform in {"posix", "nt"} else None,
+        snippet_calibration=None,
+        privacy_revision_sources=(memory, adapter) if platform in {"posix", "nt"} else (adapter,),
     )
-    if platform == "posix":
+    if platform in {"posix", "nt"}:
         assert factory.call_args.args == (settings,)
         assert factory.call_count == 1
         assert before <= factory.call_args.kwargs["clock"]() <= datetime.now(UTC)

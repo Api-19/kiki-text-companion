@@ -1,4 +1,4 @@
-"""Production Memory factory with a POSIX private file boundary."""
+"""Production Memory factory with platform-specific private file checks."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from companion.memory.errors import MemoryStoreError
 from companion.memory.service import (
@@ -17,6 +18,9 @@ from companion.memory.service import (
 )
 from companion.memory.store import _MemoryStore
 from companion.runtime.settings import Settings
+
+if TYPE_CHECKING:
+    from companion.memory.windows_storage import WindowsPrivateFiles
 
 _OS_NAME = os.name
 _DIRECTORY_MODE = 0o700
@@ -36,28 +40,43 @@ class _PrivateBoundary:
         self._directory = private_root / "memory"
         self.database_path = self._directory / "memory.sqlite3"
         self._identity: tuple[int, int] | None = None
+        self._directory_identity: tuple[int, int] | None = None
+
+    def _create_directory(self) -> None:
+        with suppress(FileExistsError):
+            os.mkdir(self._directory, _DIRECTORY_MODE)
+
+    def _check_memory_directory(self) -> tuple[int, int]:
+        info = _check_directory(self._directory)
+        return info.st_dev, info.st_ino
+
+    def _file_identity(self, path: Path) -> tuple[int, int]:
+        info = _check_file(path)
+        return info.st_dev, info.st_ino
+
+    def _create_database(self) -> None:
+        descriptor = os.open(self.database_path, _CREATE_FLAGS, _FILE_MODE)
+        os.close(descriptor)
 
     def prepare(self) -> None:
         self._check_root()
-        with suppress(FileExistsError):
-            os.mkdir(self._directory, _DIRECTORY_MODE)
-        _check_directory(self._directory)
+        self._create_directory()
+        self._directory_identity = self._check_memory_directory()
         try:
             os.lstat(self.database_path)
         except FileNotFoundError:
             if any(os.path.lexists(path) for path in self._auxiliary_paths()):
                 raise ValueError("orphan auxiliary file") from None
-            descriptor = os.open(self.database_path, _CREATE_FLAGS, _FILE_MODE)
-            os.close(descriptor)
-        info = _check_file(self.database_path)
-        self._identity = (info.st_dev, info.st_ino)
+            self._create_database()
+        self._identity = self._file_identity(self.database_path)
+        self.verify()
 
     def verify(self) -> None:
         try:
             self._check_root()
-            _check_directory(self._directory)
-            info = _check_file(self.database_path)
-            if self._identity != (info.st_dev, info.st_ino):
+            if self._directory_identity != self._check_memory_directory():
+                raise ValueError("memory directory identity changed")
+            if self._identity != self._file_identity(self.database_path):
                 raise ValueError("database identity changed")
             self._check_auxiliary_files()
         except Exception:
@@ -78,9 +97,30 @@ class _PrivateBoundary:
     def _check_auxiliary_files(self) -> None:
         for path in self._auxiliary_paths():
             try:
-                _check_file(path)
+                self._file_identity(path)
             except FileNotFoundError:
                 continue
+
+
+class _WindowsBoundary(_PrivateBoundary):
+    def __init__(self, private_root: Path, files: WindowsPrivateFiles) -> None:
+        super().__init__(private_root)
+        self._files = files
+
+    def _check_root(self) -> None:
+        self._files.check(self._root, directory=True)
+
+    def _create_directory(self) -> None:
+        self._files.create_directory(self._directory)
+
+    def _check_memory_directory(self) -> tuple[int, int]:
+        return self._files.check(self._directory, directory=True, memory_directory=True)
+
+    def _file_identity(self, path: Path) -> tuple[int, int]:
+        return self._files.check(path)
+
+    def _create_database(self) -> None:
+        self._files.create_file(self.database_path)
 
 
 def _check_directory(path: Path) -> os.stat_result:
@@ -111,9 +151,15 @@ def build_private_memory_service(
     settings: Settings, *, clock: Callable[[], datetime]
 ) -> MemoryService:
     try:
-        if _OS_NAME != "posix" or not isinstance(settings, Settings):
+        if _OS_NAME not in {"posix", "nt"} or not isinstance(settings, Settings):
             raise ValueError("private memory storage unavailable")
-        boundary = _PrivateBoundary(Path(settings.private_data_dir))
+        root = Path(settings.private_data_dir)
+        if _OS_NAME == "nt":
+            from companion.memory.windows_storage import WindowsPrivateFiles
+
+            boundary = _WindowsBoundary(root, WindowsPrivateFiles())
+        else:
+            boundary = _PrivateBoundary(root)
         boundary.prepare()
     except Exception:
         raise MemoryStoreError("memory store unavailable") from None

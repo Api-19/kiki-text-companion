@@ -67,6 +67,7 @@ def build_real_orchestrator(
     snippet_habit_card: str | None = None,
     snippet_shared_terms: Sequence[SharedTerm] | None = None,
     snippet_session_check: bool = False,
+    snippet_calibration: Callable[[str], tuple[str, tuple[SharedTerm, ...]]] | None = None,
     turn_observer: TurnObserver | None = None,
     privacy_revision_sources: Sequence[ContentRevisionSource] = (),
 ) -> DialogueOrchestrator:
@@ -83,6 +84,7 @@ def build_real_orchestrator(
         snippet_habit_card=snippet_habit_card,
         snippet_shared_terms=snippet_shared_terms,
         snippet_session_check=snippet_session_check,
+        snippet_calibration=snippet_calibration,
         veiled_terms_path=Path(__file__).resolve().parents[3] / "config/privacy/veiled_terms.json",
         provider=provider,
         ledger=MonthlyUsageLedger(settings.runtime_data_dir / "dialogue", config.budget),

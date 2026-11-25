@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from pathlib import PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 
 import keyring
@@ -30,6 +32,14 @@ def normalize_base_url(base_url: str) -> str:
         parsed.scheme.lower(), f"{userinfo}{separator}{host_port.lower()}",
         parsed.path.rstrip("/"), parsed.query, parsed.fragment,
     ))
+
+
+def credential_slot(api_key_env: str, library_source: str) -> str:
+    parent = PurePosixPath(library_source).parent
+    match = re.fullmatch(r"[0-9a-f]{32}-key-([0-9a-f]{32})", parent.name)
+    if parent.parent.name == "share-snapshots" and match:
+        return f"{api_key_env}|share-slot|{match[1]}"
+    return api_key_env
 
 
 def _account(env_name: str, base_url: str) -> str:
