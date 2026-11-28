@@ -1353,3 +1353,160 @@ def test_web_fact_confirmation_uses_local_memory(text_chat_project, monkeypatch,
     monkeypatch.setattr(module, name, run)
     flags = ["--web", "--blind"] if standalone else ["--web"]
     assert text_chat.main(["--project-root", str(root), *flags]) == 0
+
+
+@pytest.mark.parametrize("selection", [
+    ["c3", "c2", "c1"], ["c2", "c3"], ["thanks"], [], ["c2", "c2"], ["c99"],
+    ["c1", "c2", "c3", "c4", "c5"], [{"id": "c2", "question": "合成伪造", "options": []}],
+    [{"id": "c1", "question": "合成旧题错选项", "options": ["重复", "重复"]}],
+])
+def test_share_dynamic_wording_web(text_chat_project, monkeypatch, selection):
+    from http.client import HTTPConnection
+    from urllib.parse import urlsplit
+
+    from companion.dialogue.usage import MonthlyUsageLedger
+    from companion.runtime.share_calibration import ShareCalibration
+    from companion.runtime.share_calibration_web import start_web_calibration
+    from companion.runtime.share_facts import ShareFacts
+
+    root, provider = text_chat_project
+    settings = load_settings(root)
+    user = text_chat.current_user_id()
+    config, _ = dialogue_config.load_dialogue_config(settings)
+    source = config.snippet_style.library_source
+    new_scene = selection == ["thanks"]
+    pairs = [
+        PairedSnippet(
+            snippet_id=f"synthetic-source-{index}", conversation_id="synthetic-chat-id",
+            started_at=datetime(2026, 1, 1, tzinfo=UTC), source_fingerprint="e" * 64,
+            partner_turns=[context], owner_reply=[reply], privacy_flags=flags,
+        )
+        for index, (context, reply, flags) in enumerate([
+            ("合成前文，我先睡了", "晚安呀", []),
+            ("合成前文，准备睡觉了", "晚安呀", []),
+            ("合成前文，我先睡了", "晚安啦", []),
+            ("合成前文，准备睡觉了", "晚安啦", []),
+            ("合成前文，明天还要早起，我先睡", "晚安啦", ["suspect"]),
+            ("合成前文，我先睡了", "安安", []),
+            ("合成前文，我先睡了", "安安", []),
+            ("合成前文，准备睡觉了", "安安", []),
+            ("合成前文，安安，我先睡了", "晚安", []),
+            ("合成前文，安安，准备睡觉了", "晚安", []),
+        ] + ([
+            ("合成前文，我帮你拿到了", "多谢喽", []),
+            ("合成前文，替你处理好了", "多谢喽", []),
+        ] if new_scene else []))
+    ]
+    write_snippets(source, pairs)
+    source.with_name("deleted_ids.json").write_text(
+        '{"snippet_ids":["synthetic-source-7"],"ranges":[]}', encoding="utf-8",
+    )
+    now = datetime.now(UTC)
+    ledger = MonthlyUsageLedger(settings.runtime_data_dir / "dialogue", config.budget)
+    calibration = ShareCalibration(settings.private_data_dir, user)
+    result = [
+        (item if isinstance(item, dict) else
+         {"id": item, **({"question": "怎么收尾？", "options": ["回一句", "先结束"]}
+                         if item == "c1" else {})})
+        for item in selection
+    ]
+    provider.complete.side_effect = None
+    provider.complete.return_value = _blind_result(json.dumps({"questions": result}))
+    if new_scene:
+        def select_thanks(messages):
+            candidates = json.loads(messages[1].content)["candidates"]
+            (thanks,) = [item for item in candidates if item["scene"] == "thanks"]
+            return _blind_result(json.dumps({"questions": [{"id": thanks["id"]}]}))
+
+        provider.complete.side_effect = select_thanks
+    web = start_web_calibration(
+        library=source, calibration=calibration, provider_factory=lambda: provider, ledger=ledger,
+        facts=ShareFacts(user), user_id=user,
+    )
+    url = urlsplit(web.url)
+    origin = f"{url.scheme}://{url.netloc}"
+    client = HTTPConnection(url.hostname, url.port, timeout=3)
+
+    def connect_loopback(address, timeout, source_address=None):
+        assert address == ("127.0.0.1", url.port)
+        with socket.socket() as connection:
+            connection.settimeout(timeout)
+            connection.connect(address)
+            return connection.dup()
+
+    client._create_connection = connect_loopback
+
+    def post(path, payload):
+        client.request("POST", path, json.dumps(payload), {
+            "Origin": origin, "X-Calibration-Token": url.fragment,
+            "Content-Type": "application/json",
+        })
+        web.server.handle_request()
+        response = client.getresponse()
+        return response.status, json.loads(response.read())
+
+    try:
+        assert post("/state", {})[1]["count"] == (4 if new_scene else 3)
+        provider.complete.assert_not_called()
+        code, state = post("/generate", {})
+        sent = "\n".join(m.content for m in provider.complete.call_args.args[0])
+        for canary in (
+            "晚安呀", "晚安啦", "多谢喽", "合成前文", "synthetic-chat-id", "synthetic-source-",
+        ):
+            assert canary not in sent
+        payload = json.loads(provider.complete.call_args.args[0][1].content)
+        assert [c["evidence"] for c in payload["candidates"] if c["kind"] == "wording"] == (
+            [2, 2, 2] if new_scene else [2, 2]
+        )
+        assert all(set(c) == {"id", "kind", "scene", "evidence"} for c in payload["candidates"])
+        assert post("/generate", {})[0] == 409
+        provider.complete.assert_called_once()
+        if new_scene:
+            assert code == 200 and state["count"] == 1
+            assert state["question"]["question"] == (
+                "在收到帮助后感谢时，会用『多谢喽』表示『谢谢』吗？"
+            )
+            assert calibration.guidance(user) == ("", ())
+            code, state = post("/answer", {"index": 0, "action": "save", "answer": "会"})
+            assert code == 200 and state["phase"] == "complete"
+            guidance, _ = ShareCalibration(settings.private_data_dir, user).guidance(user)
+            assert "多谢喽" in guidance and "收到帮助后感谢" in guidance
+        elif selection == []:
+            assert code == 200 and state["phase"] == "complete" and state["count"] == 0
+        elif selection in (["c3", "c2", "c1"], ["c2", "c3"]):
+            assert code == 200
+            assert state["count"] == len(selection)
+            term = state["question"]["term"]
+            assert term == ("晚安啦" if selection[0] == "c3" else "晚安呀")
+            assert term in state["question"]["question"]
+            assert calibration.guidance(user) == ("", ())
+            answer = "对方已经明确道别时才这么说"
+            _, state = post("/answer", {"index": 0, "action": "save", "answer": answer})
+            assert state["question"]["term"] != term
+            if len(selection) == 2:
+                _, state = post("/answer", {"index": 1, "action": "save", "answer": "不采用"})
+                assert "没有保存" in state["message"]
+            else:
+                _, state = post("/answer", {"index": 1, "action": "uncertain"})
+            if len(selection) == 3:
+                assert state["question"]["kind"] == "closure"
+                _, state = post("/answer", {"index": 2, "action": "skip"})
+            assert state["phase"] == "complete"
+            guidance, _ = ShareCalibration(settings.private_data_dir, user).guidance(user)
+            assert term in guidance and answer in guidance and "睡前道别" in guidance
+            other = "晚安呀" if term == "晚安啦" else "晚安啦"
+            assert other not in guidance
+            provider.complete.return_value = _blind_result("合成正常回复")
+            monkeypatch.setattr("sys.stdin", io.StringIO("我准备睡觉了\n/exit\n"))
+            assert text_chat.main(["--project-root", str(root)]) == 0
+            assert provider.complete.call_count == 2
+            chat_prompt = "\n".join(m.content for m in provider.complete.call_args.args[0])
+            assert guidance in chat_prompt
+        else:
+            assert code == 502 and state["phase"] == "failed"
+            assert calibration.guidance(user) == ("", ())
+        assert ledger.snapshot(now).settled_cny > 0
+        assert ledger.snapshot(now).reserved_cny == 0
+    finally:
+        client.close()
+        web.close()

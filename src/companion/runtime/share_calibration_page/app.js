@@ -135,9 +135,17 @@ function renderQuestion() {
       const updatePreview = () => {
         const answer = selectedAnswer(question, new FormData(form));
         preview.hidden = !answer?.trim();
-        preview.textContent = preview.hidden ? "" :
-          `仅在与「${question.context}」相似的场景参考。` +
-          `对于「${question.question}」，你确认的做法是「${answer}」。`;
+        if (preview.hidden) {
+          preview.textContent = "";
+        } else if (question.kind === "wording") {
+          const rejected = answer.trim() === "不采用";
+          confirm.textContent = rejected ? "确认不采用" : "确认保存";
+          preview.textContent = rejected ? "本题不会保存用词规则。" :
+            `确认此用法后会按你的回答保存。「${answer}」`;
+        } else {
+          preview.textContent = `仅在与「${question.context}」相似的场景参考。` +
+            `对于「${question.question}」，你确认的做法是「${answer}」。`;
+        }
       };
       group.addEventListener("change", updatePreview);
       input.addEventListener("input", updatePreview);
@@ -154,7 +162,10 @@ function render(data) {
   } else if (data.phase === "ready") {
     renderStatus(
       `找到 ${data.count} 个可校准场景`,
-      "开始出题会调用已配置的模型并可能计费。模型只收到候选类型和长度分类。确认保存的内容可能随正常聊天发送。",
+      "开始出题会调用已配置的模型一次并可能计费。" +
+        (data.dynamic ? "出题只发送编号、场景分类和匿名计数。用词和片段保留在本机。"
+          : "出题只发送候选类型和长度分类。") +
+        "确认保存的内容可能随正常聊天发送。",
       true,
     );
   } else if (data.phase === "complete") {

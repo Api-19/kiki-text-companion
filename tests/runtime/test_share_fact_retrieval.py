@@ -123,3 +123,94 @@ def test_review_calibration_format_and_reservation(mode, tmp_path):
         assert totals.settled_cny == 0
     if mode == "timeout":
         assert totals.settled_cny == budget.worst_case_request_cny
+
+
+def test_wording_rules_keep_distinct_terms_and_scenes(tmp_path):
+    from companion.runtime.share_calibration import Rule, ShareCalibration, Wording
+
+    user = "synthetic-wording-user"
+    (tmp_path / "dialogue").mkdir(mode=0o700)
+    version = "share-v2-synthetic-wording"
+    card = ShareCalibration(tmp_path, user, style_version=version)
+    card.save(Rule(kind="closure", answer="合成旧规则"))
+    card.save(Wording(scene="bedtime", term="安安", answer="合成睡前用法"))
+    card.save(Wording(scene="acknowledgment", term="安安", answer="合成确认用法"))
+    card.save(Wording(scene="bedtime", term="晚安呀", answer="合成另一词用法"))
+    card.save(Wording(scene="bedtime", term="安安", answer="合成更新后用法"))
+    reopened = ShareCalibration(tmp_path, user, style_version=version)
+    guidance, terms = reopened.guidance(user)
+    assert all(text in guidance for text in (
+        "合成旧规则", "合成确认用法", "合成另一词用法", "合成更新后用法",
+    ))
+    assert "合成睡前用法" not in guidance and not terms
+    assert reopened.guidance("synthetic-other-user") == ("", ())
+    other_card = ShareCalibration(tmp_path, user, style_version="share-v2-other")
+    assert other_card.guidance(user) == ("", ())
+
+
+_WORDING_EXAMPLES = [
+    ("bedtime", "晚安喽", "我准备睡觉了", "明早有事我先睡"),
+    ("acknowledgment", "收到哇", "我把表发给你了", "行程就这样定了"),
+    ("greeting", "嗨呀", "刚上线打个招呼", "总算又见面了"),
+    ("nudge", "回个声呗", "先离开，回来再回你", "等我有空再回"),
+    ("followup", "后来咋样呀", "跟你说件事，事情还没说完", "刚才提到后来有变动"),
+    ("thanks", "多谢喽", "我帮你拿到了", "替你处理好了"),
+    ("apology", "抱歉啦", "你迟到了好久", "你把东西弄错了"),
+    ("refusal", "先不去啦", "要不要一起去", "邀请你一起来玩"),
+    ("closing", "先撤喽", "那今天先聊到这", "我要下线忙了"),
+]
+
+
+def _wording_library(tmp_path, exchanges):
+    from companion.privacy.paired_snippets import PairedSnippet, write_snippets
+
+    library = tmp_path / "library.jsonl"
+    write_snippets(library, [
+        PairedSnippet(
+            snippet_id=f"synthetic-{index}", conversation_id="synthetic",
+            source_fingerprint="a" * 64, started_at=datetime(2026, 1, 1, tzinfo=UTC),
+            partner_turns=[context], owner_reply=[reply],
+        )
+        for index, (context, reply) in enumerate(exchanges)
+    ])
+    return library
+
+
+@pytest.mark.parametrize(("scene", "term", "first", "second"), _WORDING_EXAMPLES)
+def test_wording_requires_two_distinct_action_contexts(tmp_path, scene, term, first, second):
+    from companion.runtime.share_calibration import analyse_library
+
+    exchanges = [
+        (first, term), (second, term), (first + "！", term),
+        ("普通聊天", term), ("普通闲聊", term),
+        (first, "只是短句"), (second, "只是短句"),
+        (first, "哈哈"), (second, "哈哈"),
+        (first, term + "我是合成姓名"), (second, term + "我是合成姓名"),
+        (first, term + "明天去买合成物件"), (second, term + "明天去买合成物件"),
+        (first, term + "嘛"), ("聊一下别的", term + "嘛"),
+    ]
+    library = _wording_library(tmp_path, exchanges)
+    candidates, _ = analyse_library(library, include_wording=True)
+    assert [(c.scene, c.term, c.evidence) for c in candidates if c.kind == "wording"] == [
+        (scene, term, 2),
+    ]
+
+
+def test_wording_pool_prioritizes_scene_coverage(tmp_path):
+    from companion.runtime.share_calibration import analyse_library
+
+    exchanges = [(ctx, term) for _, term, a, b in _WORDING_EXAMPLES for ctx in (a, b)]
+    exchanges.extend(
+        (ctx, term) for ctx in ("我先睡了", "准备睡觉") for term in ("晚安呀", "晚安啦")
+    )
+    exchanges.extend([
+        ("我在分享一个合成进展", "什么结果？"),
+        ("现在确认一下", "行"),
+        ("哈哈，试试「合成梗词」", "又来了"),
+        ("周末要带合成书", "记下了"),
+    ])
+    candidates, _ = analyse_library(_wording_library(tmp_path, exchanges), include_wording=True)
+    assert {c.kind for c in candidates} == {"wording", "followup", "closure", "joke", "fact"}
+    wording = [c for c in candidates if c.kind == "wording"]
+    assert len(wording) == 9
+    assert {c.scene for c in wording} == {scene for scene, *_ in _WORDING_EXAMPLES}

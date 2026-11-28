@@ -59,6 +59,70 @@ _CONDITIONS = {
     "closure": "对方只是确认或话题已经说完时",
 }
 
+_WordingScene = Literal[
+    "bedtime", "acknowledgment", "greeting", "nudge", "followup", "thanks", "apology",
+    "refusal", "closing",
+]
+
+
+@dataclass(frozen=True)
+class _WordingCue:
+    label: str
+    common: str
+    context: re.Pattern[str]
+    action: re.Pattern[str]
+
+
+def _wording_cue(label: str, common: str, context: str, action: str) -> _WordingCue:
+    # Match the whole reply, allowing short particles but no arbitrary names or clauses.
+    action_with_particles = rf"(?:{action})[啊呀啦喽哇哦嘛呢吧呗哈诶]{{0,2}}"
+    return _WordingCue(label, common, re.compile(context), re.compile(action_with_particles))
+
+
+_WORDING_SCENES: dict[_WordingScene, _WordingCue] = {
+    "bedtime": _wording_cue(
+        "睡前道别", "晚安", r"睡觉|去睡|先睡|要睡|晚安", r"晚安|安安|好梦|做个好梦",
+    ),
+    "acknowledgment": _wording_cue(
+        "简短确认收到", "好的", r"定了|发给|发你|发来|收到|就这样|确认|已经发",
+        r"好[哒嘞的]?|嗯嗯|收到|明白|了解|知道了",
+    ),
+    "greeting": _wording_cue(
+        "见面招呼", "你好", r"^你好|^哈喽|^嗨|打个招呼|刚上线|又见面|早上好|^早安",
+        r"你好|你们好|好久不见|哈[喽啰]|嗨|嘿",
+    ),
+    "nudge": _wording_cue(
+        "等回应时催一下", "请回我一下", r"晚点回|再回|等我.*回|还没回复|有空.*回",
+        r"(?:劳驾|麻烦|快)?(?:回(?:我|个声|一下|句话|个话|个消息)|吱(?:一)?声|冒个泡)",
+    ),
+    "followup": _wording_cue(
+        "听到消息后追问", "后来怎么样", r"跟你说|后来|还没说完|提到|发生了|有个消息|进展",
+        r"(?:那)?(?:后来|然后|接着)(?:(?:怎么|咋|怎样|啥)(?:样|了|回事)?|呢)?",
+    ),
+    "thanks": _wording_cue(
+        "收到帮助后感谢", "谢谢", r"(?:帮|替)你|给你(?:拿到|解决|搞定|找好)|给你弄好",
+        r"(?:真|太)?(?:谢谢(?:你)?|谢你|多谢|感谢(?:你)?|辛苦(?:你)?了)",
+    ),
+    "apology": _wording_cue(
+        "失误后道歉", "对不起", r"你.*(?:迟到|弄错|忘了|耽误|误会)|等你好久",
+        r"(?:真|实在|有点|是我)?(?:抱歉|对不起|不好意思|我错了)",
+    ),
+    "refusal": _wording_cue(
+        "谢绝邀请", "这次不参加", r"要不要|邀请你|一起(?:去|来|玩|参加)|约你",
+        r"(?:我)?(?:这次|今天|先)?(?:不去(?:了)?|不参加(?:了)?|下次再(?:去|约))",
+    ),
+    "closing": _wording_cue(
+        "日常聊天收尾", "先聊到这里", r"先聊到|聊到这|先忙|下线|有事先|回头聊|改天聊",
+        r"(?:我)?(?:先(?:撤|闪|走|下线|去忙)(?:了)?|下次聊|回头聊|改天聊|拜拜)",
+    ),
+}
+_MAX_WORDING_CANDIDATES = len(_WORDING_SCENES)
+_STANDARD_WORDING = {cue.common for cue in _WORDING_SCENES.values()} | {
+    "好", "收到", "明白", "了解", "知道了",
+}
+_WORDING_YES = "会"
+_WORDING_NO = "不采用"
+
 
 def _printable(value: str) -> str:
     if not value.strip() or not value.isprintable():
@@ -88,12 +152,24 @@ class Joke(BaseModel):
     permission: Literal["allowed", "understand_only"]
 
 
+class Wording(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    kind: Literal["wording"] = "wording"
+    scene: _WordingScene
+    term: Term
+    answer: Answer
+
+
+Addition = Rule | Joke | Wording
+
+
 class Additions(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     owner: str
     entries: Annotated[
-        list[Annotated[Rule | Joke, Field(discriminator="kind")]], Field(max_length=_MAX_RULES)
+        list[Annotated[Addition, Field(discriminator="kind")]], Field(max_length=_MAX_RULES)
     ]
 
 
@@ -118,17 +194,36 @@ class QuestionAnalysis(BaseModel):
     questions: Questions
 
 
+class DynamicSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    id: str = Field(pattern=r"^c[1-9][0-9]?$")
+    question: QuestionText | None = None
+    options: Annotated[list[QuestionText], Field(max_length=2)] | None = None
+
+
+class DynamicQuestions(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    questions: Annotated[list[DynamicSelection], Field(max_length=4)]
+
+
 @dataclass(frozen=True)
 class Candidate:
-    kind: Literal["followup", "closure", "joke", "fact"]
+    kind: Literal["followup", "closure", "joke", "fact", "wording"]
     context: str
     reply: str
     term: str = ""
+    scene: _WordingScene | None = None
+    evidence: int = 0
 
 
-def analyse_library(library: Path) -> tuple[list[Candidate], dict]:
+def analyse_library(
+    library: Path, *, include_wording: bool = False,
+) -> tuple[list[Candidate], dict]:
     pairs, _ = read_active_snippet_snapshot(library, library.parent / "deleted_ids.json")
     candidates: dict[str, Candidate] = {}
+    wording: dict[tuple[_WordingScene, str], dict[str, tuple[str, str]]] = {}
     lengths = Counter({"short": 0, "medium": 0, "long": 0})
     bursts = Counter({"one": 0, "two": 0, "three_or_more": 0})
     matches = Counter({"followup": 0, "closure": 0, "joke": 0, "fact": 0})
@@ -142,6 +237,18 @@ def analyse_library(library: Path) -> tuple[list[Candidate], dict]:
         length = sum(len(line) for line in snippet.owner_reply)
         lengths["short" if length <= 5 else "medium" if length <= 20 else "long"] += 1
         bursts[("one", "two", "three_or_more")[len(snippet.owner_reply) - 1]] += 1
+        if include_wording:
+            for line in snippet.owner_reply:
+                term = line.strip().rstrip("。！？!?～~…")
+                if not 2 <= len(term) <= 10 or term in _STANDARD_WORDING:
+                    continue
+                scenes = [
+                    scene for scene, cue in _WORDING_SCENES.items()
+                    if cue.context.search(context) and cue.action.fullmatch(term)
+                ]
+                if len(scenes) == 1:
+                    sources = wording.setdefault((scenes[0], term), {})
+                    sources.setdefault(pair.snippet_id, (context, line))
         quoted = _JOKE.search(context)
         if quoted and any(cue in context for cue in ("哈哈", "玩笑", "玩梗")):
             item = Candidate("joke", context, reply, quoted[1] or quoted[2])
@@ -156,6 +263,19 @@ def analyse_library(library: Path) -> tuple[list[Candidate], dict]:
         matches[item.kind] += 1
         candidates.setdefault(item.kind, item)
     selected = [candidates[kind] for kind in (*_CONDITIONS, "joke", "fact") if kind in candidates]
+    ranked_wording = []
+    for (scene, term), sources in wording.items():
+        count = len({re.sub(r"[\W_]+", "", context) for context, _ in sources.values()})
+        if count >= 2:
+            context, reply = next(iter(sources.values()))
+            ranked_wording.append(Candidate("wording", context, reply, term, scene, count))
+    ranked_wording.sort(key=lambda item: (-item.evidence, item.term, item.scene))
+    first_per_scene: dict[_WordingScene | None, Candidate] = {}
+    for item in ranked_wording:
+        first_per_scene.setdefault(item.scene, item)
+    preferred = list(first_per_scene.values())
+    preferred.extend(item for item in ranked_wording if item != first_per_scene[item.scene])
+    selected.extend(preferred[:_MAX_WORDING_CANDIDATES])
     signals = {
         "pairs": lengths.total(),
         "reply_length": dict(lengths),
@@ -169,7 +289,9 @@ def find_candidates(library: Path) -> list[Candidate]:
     return analyse_library(library)[0]
 
 
-def _key(entry: Rule | Joke) -> tuple[str, str]:
+def _key(entry: Addition) -> tuple[str, ...]:
+    if isinstance(entry, Wording):
+        return entry.kind, entry.scene, entry.term
     return entry.kind, entry.term if isinstance(entry, Joke) else ""
 
 
@@ -188,7 +310,7 @@ class ShareCalibration:
             self._files = WindowsPrivateFiles()
         self._entries = self._read()
 
-    def _read(self) -> list[Rule | Joke]:
+    def _read(self) -> list[Addition]:
         path = self._path
         reject_link_ancestors(path)
         if self._files is not None:
@@ -221,7 +343,7 @@ class ShareCalibration:
             raise ValueError("calibration account mismatch")
         return saved.entries
 
-    def save(self, entry: Rule | Joke) -> None:
+    def save(self, entry: Addition) -> None:
         directory = self._path.parent
         reject_link_ancestors(self._path)
         if self._files is not None:
@@ -252,7 +374,13 @@ class ShareCalibration:
             return "", ()
         lines, terms = [], []
         for entry in self._entries:
-            if isinstance(entry, Rule):
+            if isinstance(entry, Wording):
+                cue = _WORDING_SCENES[entry.scene]
+                lines.append(
+                    f"- 仅在「{cue.label}」时参考「{entry.term}」表示「{cue.common}」的用法。"
+                    f"用户确认：「{entry.answer}」。"
+                )
+            elif isinstance(entry, Rule):
                 lines.append(f"- {style_rule_text(entry)}")
             else:
                 terms.append(SharedTerm(
@@ -355,7 +483,9 @@ def prepare_style_answer(
     question: Question,
     answer: str,
     permission: Literal["understand_only", "allowed"] | None = None,
-) -> Rule | Joke:
+) -> Addition:
+    if candidate.kind == "wording" and candidate.scene is not None and permission is None:
+        return Wording(scene=candidate.scene, term=candidate.term, answer=answer)
     if candidate.kind == "joke" and permission is not None:
         return Joke(term=candidate.term, meaning=answer, permission=permission)
     if candidate.kind in _CONDITIONS and permission is None:
@@ -398,6 +528,81 @@ def generate_questions(
             features if signals is None else {"signals": signals, "candidates": features},
         )),
     )
+    text = _request_question_json(messages, provider, ledger)
+    if signals is None:
+        questions = _QUESTIONS.validate_json(text)
+        uncertainty = None
+    else:
+        analysis = QuestionAnalysis.model_validate_json(text)
+        questions, uncertainty = analysis.questions, analysis.uncertainty
+    if len(questions) != len(candidates) or any(
+        len(question.options) != (0 if item.kind == "fact" else 2)
+        or len(set(question.options)) != len(question.options)
+        for item, question in zip(candidates, questions, strict=True)
+    ):
+        raise ValueError("question batch does not match candidates")
+    return questions, uncertainty
+
+
+def generate_dynamic_questions(
+    candidates: list[Candidate], provider: DialogueProvider, ledger: MonthlyUsageLedger,
+    *, signals: dict,
+) -> tuple[list[Candidate], list[Question]]:
+    pool = {f"c{index}": item for index, item in enumerate(candidates, 1)}
+    features = [
+        {
+            "id": identifier, "kind": item.kind, "scene": item.scene or item.kind,
+            "evidence": item.evidence if item.kind == "wording"
+            else signals["candidate_signals"][item.kind],
+        }
+        for identifier, item in pool.items()
+    ]
+    instructions = (
+        '只输出 JSON 对象 {"questions": [...]}。依据匿名场景、证据计数和回复统计，'
+        "按优先级选择最多 4 个不同候选，也可给空数组。证据相近时优先覆盖不同场景。"
+        "wording 仅返回 id，本机根据证据生成题文和选项。其余各返回 id、question、options。"
+        "followup 问何时追问，closure 问何时收尾，joke 问占位词含义，各给两个不同的通用选项。"
+        "fact 只问是否需确认本机所示事项，options 为空。"
+        "问题和选项各限 40 字，不要猜测用户信息、具体事件或原词。"
+    )
+    messages = (
+        PromptMessage(role="system", content=instructions),
+        PromptMessage(
+            role="user", content=json.dumps({"signals": signals, "candidates": features}),
+        ),
+    )
+    text = _request_question_json(messages, provider, ledger)
+    selection = DynamicQuestions.model_validate_json(text).questions
+    ids = [item.id for item in selection]
+    if len(set(ids)) != len(ids) or not all(identifier in pool for identifier in ids):
+        raise ValueError("invalid candidate selection")
+    chosen = [pool[identifier] for identifier in ids]
+    questions = []
+    for candidate, item in zip(chosen, selection, strict=True):
+        if candidate.scene is not None:
+            if item.model_fields_set != {"id"}:
+                raise ValueError("wording question must be rendered locally")
+            cue = _WORDING_SCENES[candidate.scene]
+            question = Question(
+                question=f"在{cue.label}时，会用『{candidate.term}』表示『{cue.common}』吗？",
+                options=[_WORDING_YES, _WORDING_NO],
+            )
+        else:
+            options = item.options
+            if (
+                item.question is None or options is None
+                or len(options) != (0 if candidate.kind == "fact" else 2)
+                or len(set(options)) != len(options)
+            ):
+                raise ValueError("question does not match candidate")
+            question = Question(question=item.question, options=options)
+        questions.append(question)
+    return chosen, questions
+
+
+def _request_question_json(
+    messages: tuple[PromptMessage, ...], provider: DialogueProvider, ledger: MonthlyUsageLedger,
+) -> str:
     now = datetime.now(UTC)
     reservation, = ledger.reserve(1, now)
     result = None
@@ -418,19 +623,7 @@ def generate_questions(
     fenced = re.fullmatch(r"```json[ \t]*\r?\n(.*?)\r?\n```", text, re.IGNORECASE | re.DOTALL)
     if fenced:
         text = fenced[1]
-    if signals is None:
-        questions = _QUESTIONS.validate_json(text)
-        uncertainty = None
-    else:
-        analysis = QuestionAnalysis.model_validate_json(text)
-        questions, uncertainty = analysis.questions, analysis.uncertainty
-    if len(questions) != len(candidates) or any(
-        len(question.options) != (0 if item.kind == "fact" else 2)
-        or len(set(question.options)) != len(question.options)
-        for item, question in zip(candidates, questions, strict=True)
-    ):
-        raise ValueError("question batch does not match candidates")
-    return questions, uncertainty
+    return text
 
 
 def question_failure_message(error: Exception) -> str:

@@ -1557,7 +1557,9 @@ def test_guided_first_setup_opens_questions_before_chat(
     assert SYNTHETIC_KEY not in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("mode", ["skip", "bad-model", "empty-candidates", "budget"])
+@pytest.mark.parametrize(
+    "mode", ["skip", "bad-model", "empty-candidates", "budget", "dynamic-zero", "dynamic-skip"],
+)
 def test_guided_setup_keeps_chat_available_without_questions(
     session, tmp_path, monkeypatch, mode, capsys,
 ):
@@ -1568,6 +1570,10 @@ def test_guided_setup_keeps_chat_available_without_questions(
     rows = standard_rows()
     if mode in {"bad-model", "budget"}:
         rows[21]["text"] = "怎么继续？"
+    if mode.startswith("dynamic-"):
+        for index in range(0, len(rows), 2):
+            rows[index]["text"] = f"合成前文{index}，我先睡了"
+            rows[index + 1]["text"] = "晚安呀"
     if mode == "budget":
         from companion.dialogue.usage import BudgetExceeded, MonthlyUsageLedger
 
@@ -1576,22 +1582,32 @@ def test_guided_setup_keeps_chat_available_without_questions(
     source = tmp_path / "synthetic.json"
     source.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
     args = ["--guided", *standard_args(source)]
-    accepted = "" if mode == "skip" else "开始"
+    accepted = "" if mode in {"skip", "dynamic-skip"} else "开始"
     answer(monkeypatch, "同意", "同意", "1", "同意", "", "", "", "", accepted, "/exit")
     open_browser = Mock()
     monkeypatch.setattr("webbrowser.open", open_browser)
     monkeypatch.setattr(text_chat, "current_user_id", lambda: "synthetic-local-user")
     monkeypatch.setattr(text_chat, "load_api_key", session.load)
     provider = Mock()
-    provider.complete.return_value = ProviderResult(text="invalid synthetic questions")
+    def complete(messages):
+        if mode == "dynamic-zero":
+            payload = json.loads(messages[1].content)
+            assert any(c["kind"] == "wording" for c in payload["candidates"])
+            assert all("晚安呀" not in m.content and "合成前文" not in m.content for m in messages)
+            return ProviderResult(text='{"questions":[]}')
+        return ProviderResult(text="invalid synthetic questions")
+
+    provider.complete.side_effect = complete
     monkeypatch.setattr(composition, "OpenAICompatibleProvider", Mock(return_value=provider))
     assert setup.main(args) == 0
     assert config_path(session).exists()
-    assert provider.complete.call_count == (mode == "bad-model")
+    assert provider.complete.call_count == (mode in {"bad-model", "dynamic-zero"})
     open_browser.assert_not_called()
     output = capsys.readouterr().out
     if mode in {"bad-model", "budget"}:
         assert "分析或出题暂未完成" in output
+    if mode == "dynamic-zero":
+        assert "本轮没有选出需要确认的问题" in output
     if mode == "empty-candidates":
         assert "没有找到适合校准的片段" in output
     answer(monkeypatch, "/exit")

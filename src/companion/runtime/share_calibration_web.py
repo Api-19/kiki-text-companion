@@ -19,6 +19,7 @@ from companion.memory.errors import MemoryAuthorizationError, MemoryServiceError
 from companion.privacy.paired_snippets import ActiveSnippetReadError
 from companion.runtime.share_calibration import (
     analyse_library,
+    generate_dynamic_questions,
     generate_questions,
     prepare_style_answer,
     question_failure_message,
@@ -61,6 +62,7 @@ class CalibrationPage:
         self,
         *,
         candidates: list[Candidate],
+        signals: dict,
         phase: str,
         calibration: ShareCalibration,
         provider_factory: Callable[[], DialogueProvider],
@@ -69,6 +71,8 @@ class CalibrationPage:
         user_id: str,
     ) -> None:
         self.candidates = candidates
+        self.signals = signals
+        self.dynamic = any(item.kind == "wording" for item in candidates)
         self.phase = phase
         self.calibration = calibration
         self.provider_factory = provider_factory
@@ -83,6 +87,8 @@ class CalibrationPage:
 
     def state(self) -> dict:
         state = {"phase": self.phase, "count": len(self.candidates), "index": self.index}
+        if self.phase == "ready" and self.dynamic:
+            state["dynamic"] = True
         if self.uncertainty is not None:
             state["uncertainty"] = self.uncertainty
         if self.phase == "active":
@@ -101,11 +107,20 @@ class CalibrationPage:
             return 409, {"message": "本轮无法再次出题。"}
         self.phase = "failed"
         try:
-            self.questions, self.uncertainty = generate_questions(
-                self.candidates, self.provider_factory(), self.ledger, signals=signals,
-            )
+            provider = self.provider_factory()
+            if self.dynamic:
+                self.candidates, self.questions = generate_dynamic_questions(
+                    self.candidates, provider, self.ledger, signals=self.signals,
+                )
+            else:
+                self.questions, self.uncertainty = generate_questions(
+                    self.candidates, provider, self.ledger, signals=signals,
+                )
         except (ProviderError, UsageLedgerError, ValueError) as error:
             return 502, {"message": question_failure_message(error), **self.state()}
+        if not self.questions:
+            self.phase = "complete"
+            return 200, {"message": "本轮没有选出需要确认的问题。", **self.state()}
         self.phase = "active"
         return 200, self.state()
 
@@ -141,8 +156,14 @@ class CalibrationPage:
         if candidate.kind != "fact":
             if data.scope is not None or data.authorize:
                 raise ValueError("memory scope on style answer")
+            if candidate.kind == "wording":
+                answer = data.answer.strip()
+                if answer == "不采用":
+                    return "已标记不采用，没有保存。"
+            else:
+                answer = data.answer
             entry = prepare_style_answer(
-                candidate, self.questions[self.index], data.answer, data.permission,
+                candidate, self.questions[self.index], answer, data.permission,
             )
             self.calibration.save(entry)
             return "已保存风格。"
@@ -320,13 +341,13 @@ def start_web_calibration(
     user_id: str,
 ) -> CalibrationWeb:
     try:
-        candidates, signals = analyse_library(library)
+        candidates, signals = analyse_library(library, include_wording=True)
         phase = "ready" if candidates else "empty"
     except ActiveSnippetReadError:
         candidates, signals = [], {}
         phase = "failed"
     page = CalibrationPage(
-        candidates=candidates, phase=phase, calibration=calibration,
+        candidates=candidates, signals=signals, phase=phase, calibration=calibration,
         provider_factory=provider_factory, ledger=ledger, facts=facts,
         user_id=user_id,
     )
@@ -359,6 +380,8 @@ def run_web_calibration(
                 _, result = session.generate()
                 if page.phase != "active":
                     print(result["message"])
+                    if page.phase == "complete":
+                        return
             if page.phase != "active":
                 if page.phase == "empty":
                     print("没有找到适合校准的片段，可以继续聊天。")
